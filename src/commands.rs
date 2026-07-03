@@ -1,13 +1,7 @@
-use crate::{Ballot, NodeId, NodeMetadata, Slot};
+use crate::round::PaxosRound;
+use crate::{Ballot, NodeId, Slot, round::Phase};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-/// Sends commands to other replicas in addition to applying
-/// resolved commands at the current replica
-pub trait Transport {
-    /// Send a message to a single node
-    fn send(&mut self, node: NodeId, node_metadata: &NodeMetadata, command: Command);
-}
 
 /// Receiver of Paxos commands.
 pub trait Receiver {
@@ -23,37 +17,44 @@ pub trait Commander {
     fn proposal(&mut self, val: Bytes);
 
     /// Receive a Phase 1a PREPARE message containing the proposed ballot
-    fn prepare(&mut self, bal: Ballot);
+    fn prepare(&mut self, slot: Slot, bal: Ballot);
 
     /// Receive a Phase 1b PROMISE message containing the node
-    /// that generated the promise, the ballot promised and all accepted
-    /// values within the open window.
-    fn promise(&mut self, node: NodeId, bal: Ballot, accepted: Vec<(Slot, Ballot, Bytes)>);
+    /// that generated the promise, the ballot promised and the accepted
+    /// value for this slot, if one exists.
+    fn promise(&mut self, node: NodeId, slot: Slot, bal: Ballot, accepted: Option<(Ballot, Bytes)>);
 
     /// Receive a Phase 2a ACCEPT message that contains the the slot, proposed
     /// ballot and value of the proposal. The ballot contains the node of
     /// the leader of the slot.
-    fn accept(&mut self, bal: Ballot, slot_values: Vec<(Slot, Bytes)>);
+    fn accept(&mut self, slot: Slot, bal: Ballot, value: Bytes);
 
     /// Receives a REJECT message from a peer containing a higher ballot that
     /// preempts either a Phase 1a (PREPARE) for Phase 2a (ACCEPT) message.
-    fn reject(&mut self, node: NodeId, proposed: Ballot, preempted: Ballot);
+    fn reject(
+        &mut self,
+        node: NodeId,
+        slot: Slot,
+        proposed: Ballot,
+        preempted: Ballot,
+        phase: Phase,
+    );
 
     /// Receives a Phase 2b ACCEPTED message containing the acceptor that has
     /// accepted the slot's proposal along with the ballot that generated
     /// the slot.
-    fn accepted(&mut self, node: NodeId, bal: Ballot, slots: Vec<Slot>);
+    fn accepted(&mut self, node: NodeId, slot: Slot, bal: Ballot);
 
     /// Receives a final resolution of a slot that has been accepted by a
     /// majority of acceptors.
     ///
     /// NOTE: Resolutions may arrive out-of-order. No guarantees are made on
     /// slot order.
-    fn resolution(&mut self, bal: Ballot, values: Vec<(Slot, Bytes)>);
+    fn resolution(&mut self, slot: Slot, bal: Ballot, value: Bytes);
 
     /// Request sent to a distinguished learner to catch up to latest slot
     /// values.
-    fn catchup(&mut self, node: NodeId, slots: Vec<Slot>);
+    fn catchup(&mut self, node: NodeId, slot: Slot);
 }
 
 impl<T: Commander> Receiver for T {
@@ -62,26 +63,26 @@ impl<T: Commander> Receiver for T {
             Command::Proposal(val) => {
                 self.proposal(val);
             }
-            Command::Prepare(bal) => {
-                self.prepare(bal);
+            Command::Prepare { slot, ballot } => {
+                self.prepare(slot, ballot);
             }
-            Command::Promise(node, bal, accepted) => {
-                self.promise(node, bal, accepted);
+            Command::Promise { from, slot, ballot, accepted } => {
+                self.promise(from, slot, ballot, accepted);
             }
-            Command::Accept(bal, slot_vals) => {
-                self.accept(bal, slot_vals);
+            Command::Accept { slot, ballot, value } => {
+                self.accept(slot, ballot, value);
             }
-            Command::Reject(node, proposed, preempted) => {
-                self.reject(node, proposed, preempted);
+            Command::Reject { from, slot, proposed, preempted, phase } => {
+                self.reject(from, slot, proposed, preempted, phase);
             }
-            Command::Accepted(node, bal, slots) => {
-                self.accepted(node, bal, slots);
+            Command::Accepted { from, slot, ballot } => {
+                self.accepted(from, slot, ballot);
             }
-            Command::Resolution(bal, slot_vals) => {
-                self.resolution(bal, slot_vals);
+            Command::Resolution { slot, ballot, value } => {
+                self.resolution(slot, ballot, value);
             }
-            Command::Catchup(node, slots) => {
-                self.catchup(node, slots);
+            Command::Catchup { from, slot } => {
+                self.catchup(from, slot);
             }
         }
     }
@@ -94,35 +95,66 @@ pub enum Command {
     Proposal(Bytes),
 
     /// Phase 1a PREPARE message containing the proposed ballot
-    Prepare(Ballot),
+    Prepare { slot: Slot, ballot: Ballot },
 
     /// Phase 1b PROMISE message containing the node
-    /// that generated the promise, the ballot promised and all accepted
-    /// values within the open window.
-    Promise(NodeId, Ballot, Vec<(Slot, Ballot, Bytes)>),
+    /// that generated the promise, the ballot promised and the slot's
+    /// previously accepted value, if one exists.
+    Promise { from: NodeId, slot: Slot, ballot: Ballot, accepted: Option<(Ballot, Bytes)> },
 
     /// Phase 2a ACCEPT message that contains the the slot, proposed
     /// ballot and value of the proposal. The ballot contains the node of
     /// the leader of the slot.
-    Accept(Ballot, Vec<(Slot, Bytes)>),
+    Accept { slot: Slot, ballot: Ballot, value: Bytes },
 
     /// REJECT a peer's previous message containing a higher ballot that
     /// preempts either a Phase 1a (PREPARE) for Phase 2a (ACCEPT) message.
-    Reject(NodeId, Ballot, Ballot),
+    Reject { from: NodeId, slot: Slot, proposed: Ballot, preempted: Ballot, phase: Phase },
 
     /// Phase 2b ACCEPTED message containing the acceptor that has
     /// accepted the slot's proposal along with the ballot that generated
     /// the slot.
-    Accepted(NodeId, Ballot, Vec<Slot>),
+    Accepted { from: NodeId, slot: Slot, ballot: Ballot },
 
     /// Resolution of a slot that has been accepted by a
     /// majority of acceptors.
     ///
     /// NOTE: Resolutions may arrive out-of-order. No guarantees are made on
     /// slot order.
-    Resolution(Ballot, Vec<(Slot, Bytes)>),
+    Resolution { slot: Slot, ballot: Ballot, value: Bytes },
 
     /// Request sent to a distinguished learner to catch up to latest slot
     /// values.
-    Catchup(NodeId, Vec<Slot>),
+    Catchup { from: NodeId, slot: Slot },
+}
+
+impl Command {
+    /// Returns the Paxos round that is part of the command's protocol payload.
+    ///
+    /// Proposal and catchup messages are intentionally excluded: proposals are
+    /// client work forwarded between replicas, and catchup requests do not carry
+    /// a ballot in the original protocol.
+    pub fn protocol_round(&self) -> Option<PaxosRound> {
+        match self {
+            Command::Proposal(_) | Command::Catchup { .. } => None,
+            Command::Prepare { slot, ballot } => {
+                Some(PaxosRound::new(*slot, ballot.0, Phase::Prepare))
+            }
+            Command::Promise { slot, ballot, .. } => {
+                Some(PaxosRound::new(*slot, ballot.0, Phase::Promise))
+            }
+            Command::Accept { slot, ballot, .. } => {
+                Some(PaxosRound::new(*slot, ballot.0, Phase::Accept))
+            }
+            Command::Reject { slot, proposed, .. } => {
+                Some(PaxosRound::new(*slot, proposed.0, Phase::Reject))
+            }
+            Command::Accepted { slot, ballot, .. } => {
+                Some(PaxosRound::new(*slot, ballot.0, Phase::Accepted))
+            }
+            Command::Resolution { slot, ballot, .. } => {
+                Some(PaxosRound::new(*slot, ballot.0, Phase::Resolution))
+            }
+        }
+    }
 }

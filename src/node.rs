@@ -1,32 +1,70 @@
 use crate::{
+    Ballot, Configuration, NodeId, Replica, Slot,
     acceptor::{AcceptResponse, PrepareResponse},
     commands::*,
     proposer::{Proposer, ProposerState},
+    round::{PaxosRound, Phase},
     window::{DecisionSet, SlotMutRef, SlotWindow},
-    Ballot, Configuration, NodeId, Replica, Slot,
 };
 use bytes::Bytes;
-use std::mem;
+use traceforge_rounds::{Comm, CommError, Transport as RoundTransport};
 
 /// State manager for multi-paxos group
-pub struct Node<T> {
-    transport: T,
-    config: Configuration,
+pub struct Node<T: RoundTransport<PaxosRound, Command>> {
+    comm: Comm<PaxosRound, T>,
+    config: Configuration<T::Node>,
     proposer: Proposer,
     window: SlotWindow,
 }
 
-impl<T: Transport> Node<T> {
+impl<T> Node<T>
+where
+    T: RoundTransport<PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+{
     /// Node creation from a sender and starting configuration
-    pub fn new(transport: T, config: Configuration) -> Node<T> {
+    pub fn with_comm(comm: Comm<PaxosRound, T>, config: Configuration<T::Node>) -> Node<T> {
         let (p1_quorum, p2_quorum) = config.quorum_size();
         let node = config.current();
         Node {
-            transport,
+            comm,
             config,
             proposer: Proposer::new(node, p1_quorum),
             window: SlotWindow::new(p2_quorum),
         }
+    }
+
+    /// Node creation from a transport and starting configuration.
+    pub fn new(transport: T, config: Configuration<T::Node>) -> Node<T> {
+        Self::with_comm(Comm::new(transport), config)
+    }
+
+    pub fn comm(&self) -> &Comm<PaxosRound, T> {
+        &self.comm
+    }
+
+    pub fn comm_mut(&mut self) -> &mut Comm<PaxosRound, T> {
+        &mut self.comm
+    }
+
+    pub fn current_node_id(&self) -> NodeId {
+        self.config.current()
+    }
+
+    pub fn current_round(&mut self) -> PaxosRound {
+        self.comm.rounds().current().clone()
+    }
+
+    pub fn highest_observed_ballot(&self) -> Option<Ballot> {
+        self.proposer.highest_observed_ballot()
+    }
+
+    fn enter_round(&mut self, slot: Slot, ballot: Ballot, phase: Phase) {
+        self.comm
+            .rounds()
+            .jump(PaxosRound::new(slot, ballot.0, phase))
+            .expect("round movement must not move to the past");
     }
 
     /// Broadcast ACCEPT messages once the proposer has phase 1 quorum
@@ -72,8 +110,13 @@ impl<T: Transport> Node<T> {
             .collect::<Vec<_>>();
 
         // send out the accepts
-        if !accepts.is_empty() {
-            self.broadcast(Command::Accept(bal, accepts));
+        for (slot, value) in accepts {
+            self.broadcast_at(
+                slot,
+                bal,
+                Phase::Accept,
+                Command::Accept { slot, ballot: bal, value },
+            );
         }
     }
 
@@ -93,18 +136,109 @@ impl<T: Transport> Node<T> {
 
     #[inline(always)]
     fn send(&mut self, node: NodeId, cmd: Command) {
-        self.transport.send(node, &self.config[node], cmd)
+        let dst = self.config[node].clone();
+        self.comm.send(dst, cmd).expect("transport send failed");
     }
 
     #[inline(always)]
-    fn broadcast(&mut self, cmd: Command) {
-        for node in self.config.peer_node_ids().into_iter() {
-            self.transport.send(node, &self.config[node], cmd.clone());
+    fn send_at(&mut self, node: NodeId, slot: Slot, ballot: Ballot, phase: Phase, cmd: Command) {
+        self.enter_round(slot, ballot, phase);
+        self.send(node, cmd);
+    }
+
+    #[inline(always)]
+    fn broadcast_at(&mut self, slot: Slot, ballot: Ballot, phase: Phase, cmd: Command) {
+        self.enter_round(slot, ballot, phase);
+        for node in self.config.peer_node_ids().collect::<Vec<_>>() {
+            self.send(node, cmd.clone());
         }
+    }
+
+    pub fn receive_stamped(&mut self, round: PaxosRound, cmd: Command) {
+        if let Some(protocol_round) = cmd.protocol_round() {
+            assert_eq!(
+                round, protocol_round,
+                "transport stamp must match the command's Paxos round"
+            );
+            self.comm
+                .rounds()
+                .jump(round)
+                .expect("received stamped command must not move to the past");
+        }
+        self.receive(cmd);
+    }
+
+    pub fn collect_promise_inbox(
+        &mut self,
+        slot: Slot,
+        ballot: Ballot,
+        min: usize,
+        max: usize,
+    ) -> Result<usize, CommError<PaxosRound, Command, T::Error>>
+    where
+        Command: 'static,
+    {
+        self.enter_round(slot, ballot, Phase::Promise);
+        let messages = self.comm.inbox_with_bounds_with::<Command, _>(
+            min,
+            Some(max),
+            move |local, remote| {
+                local.slot() == remote.slot()
+                    && local.ballot() == remote.ballot()
+                    && local.phase() == Phase::Promise
+                    && remote.phase() == Phase::Promise
+            },
+        )?;
+
+        let mut count = 0;
+        for msg in messages.into_iter().flatten() {
+            if let Command::Promise { .. } = msg {
+                count += 1;
+                self.receive(msg);
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn collect_accepted_inbox(
+        &mut self,
+        slot: Slot,
+        ballot: Ballot,
+        min: usize,
+        max: usize,
+    ) -> Result<usize, CommError<PaxosRound, Command, T::Error>>
+    where
+        Command: 'static,
+    {
+        self.enter_round(slot, ballot, Phase::Accepted);
+        let messages = self.comm.inbox_with_bounds_with::<Command, _>(
+            min,
+            Some(max),
+            move |local, remote| {
+                local.slot() == remote.slot()
+                    && local.ballot() == remote.ballot()
+                    && local.phase() == Phase::Accepted
+                    && remote.phase() == Phase::Accepted
+            },
+        )?;
+
+        let mut count = 0;
+        for msg in messages.into_iter().flatten() {
+            if let Command::Accepted { .. } = msg {
+                count += 1;
+                self.receive(msg);
+            }
+        }
+        Ok(count)
     }
 }
 
-impl<T: Transport> Commander for Node<T> {
+impl<T> Commander for Node<T>
+where
+    T: RoundTransport<PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+{
     fn proposal(&mut self, val: Bytes) {
         // redirect to the distinguished proposer or start PREPARE
         match *self.proposer.state() {
@@ -129,54 +263,66 @@ impl<T: Transport> Commander for Node<T> {
                     slot_ref.acceptor().notice_value(bal, val.clone());
                     slot_ref.slot()
                 };
-                self.broadcast(Command::Accept(bal, vec![(slot, val.clone())]));
+                self.broadcast_at(
+                    slot,
+                    bal,
+                    Phase::Accept,
+                    Command::Accept { slot, ballot: bal, value: val },
+                );
             }
         }
     }
 
-    fn prepare(&mut self, bal: Ballot) {
+    fn prepare(&mut self, slot: Slot, bal: Ballot) {
         self.proposer.observe_ballot(bal);
 
         let node_id = self.config.current();
 
-        let mut accepted = Vec::new();
-        for slot in self.window.open_range() {
-            match self.window.slot_mut(slot) {
-                SlotMutRef::Open(ref mut open_ref) => {
-                    match open_ref.acceptor().receive_prepare(bal) {
-                        PrepareResponse::Promise { value: Some((bal, val)), .. } => {
-                            accepted.push((slot, bal, val));
-                        }
-                        PrepareResponse::Reject { proposed, preempted } => {
-                            // found a slot that accepted a higher ballot, send the reject
-                            let node = bal.1;
-                            self.transport.send(
-                                node,
-                                &self.config[node],
-                                Command::Reject(node_id, proposed, preempted),
-                            );
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                SlotMutRef::Resolved(bal, val) => {
-                    // TODO: is this the right thing to do here?????
-                    accepted.push((slot, bal, val));
-                }
-
-                SlotMutRef::Empty(_) => {
-                    warn!("Empty slot {} detected in the middle of the open range", slot);
-                }
-                SlotMutRef::ResolutionTruncated => {
-                    unreachable!("Cannot be resolved in the middle of the open range")
-                }
+        let response = match self.window.slot_mut(slot) {
+            SlotMutRef::Open(ref mut open_ref) => open_ref.acceptor().receive_prepare(bal),
+            SlotMutRef::Empty(empty_slot) => empty_slot.fill().acceptor().receive_prepare(bal),
+            SlotMutRef::Resolved(accepted_ballot, val) => {
+                PrepareResponse::Promise { proposed: bal, value: Some((accepted_ballot, val)) }
             }
+            SlotMutRef::ResolutionTruncated => PrepareResponse::Resolved,
+        };
+
+        match response {
+            PrepareResponse::Promise { value, .. } => {
+                self.send_at(
+                    bal.1,
+                    slot,
+                    bal,
+                    Phase::Promise,
+                    Command::Promise { from: node_id, slot, ballot: bal, accepted: value },
+                );
+            }
+            PrepareResponse::Reject { proposed, preempted } => {
+                self.send_at(
+                    bal.1,
+                    slot,
+                    proposed,
+                    Phase::Reject,
+                    Command::Reject {
+                        from: node_id,
+                        slot,
+                        proposed,
+                        preempted,
+                        phase: Phase::Prepare,
+                    },
+                );
+            }
+            PrepareResponse::Resolved => {}
         }
-        self.send(bal.1, Command::Promise(node_id, bal, accepted));
     }
 
-    fn promise(&mut self, node: NodeId, bal: Ballot, accepted: Vec<(Slot, Ballot, Bytes)>) {
+    fn promise(
+        &mut self,
+        node: NodeId,
+        slot: Slot,
+        bal: Ballot,
+        accepted: Option<(Ballot, Bytes)>,
+    ) {
         if !self.proposer.state().is_candidate() {
             return;
         }
@@ -184,13 +330,13 @@ impl<T: Transport> Commander for Node<T> {
         self.proposer.receive_promise(node, bal);
 
         // track highest proposals
-        for (slot, bal, val) in accepted.into_iter() {
+        if let Some((accepted_ballot, val)) = accepted {
             match self.window.slot_mut(slot) {
                 SlotMutRef::Open(ref mut open_slot) => {
-                    open_slot.acceptor().notice_value(bal, val);
+                    open_slot.acceptor().notice_value(accepted_ballot, val);
                 }
                 SlotMutRef::Empty(empty_slot) => {
-                    empty_slot.fill().acceptor().notice_value(bal, val);
+                    empty_slot.fill().acceptor().notice_value(accepted_ballot, val);
                 }
                 _ => {}
             }
@@ -200,82 +346,94 @@ impl<T: Transport> Commander for Node<T> {
         self.drive_accept();
     }
 
-    fn accept(&mut self, bal: Ballot, slot_values: Vec<(Slot, Bytes)>) {
+    fn accept(&mut self, slot: Slot, bal: Ballot, val: Bytes) {
         self.proposer.observe_ballot(bal);
 
         let current_node = self.config.current();
-        let mut accepted_slots = Vec::with_capacity(slot_values.len());
-        for (slot, val) in slot_values.into_iter() {
-            let acceptor_res = match self.window.slot_mut(slot) {
-                SlotMutRef::Empty(empty_slot) => {
-                    let mut open_slot = empty_slot.fill();
-                    open_slot.acceptor().receive_accept(bal, val)
-                }
-                SlotMutRef::Open(ref mut open_slot) => {
-                    open_slot.acceptor().receive_accept(bal, val)
-                }
-                _ => return,
-            };
-
-            match acceptor_res {
-                AcceptResponse::Accepted { .. } => {
-                    // TODO: what do we do w/ the preempted proposal
-                    accepted_slots.push(slot);
-                }
-                AcceptResponse::Reject { proposed, preempted } => {
-                    self.send(bal.1, Command::Reject(current_node, proposed, preempted));
-                    return;
-                }
-                _ => {}
+        let acceptor_res = match self.window.slot_mut(slot) {
+            SlotMutRef::Empty(empty_slot) => {
+                let mut open_slot = empty_slot.fill();
+                open_slot.acceptor().receive_accept(bal, val)
             }
-        }
+            SlotMutRef::Open(ref mut open_slot) => open_slot.acceptor().receive_accept(bal, val),
+            _ => return,
+        };
 
-        self.send(bal.1, Command::Accepted(current_node, bal, accepted_slots));
+        match acceptor_res {
+            AcceptResponse::Accepted { .. } => {
+                self.send_at(
+                    bal.1,
+                    slot,
+                    bal,
+                    Phase::Accepted,
+                    Command::Accepted { from: current_node, slot, ballot: bal },
+                );
+            }
+            AcceptResponse::Reject { proposed, preempted } => {
+                self.send_at(
+                    bal.1,
+                    slot,
+                    proposed,
+                    Phase::Reject,
+                    Command::Reject {
+                        from: current_node,
+                        slot,
+                        proposed,
+                        preempted,
+                        phase: Phase::Accept,
+                    },
+                );
+            }
+            AcceptResponse::Resolved => {}
+        }
     }
 
-    fn reject(&mut self, node: NodeId, proposed: Ballot, promised: Ballot) {
+    fn reject(
+        &mut self,
+        node: NodeId,
+        _slot: Slot,
+        proposed: Ballot,
+        promised: Ballot,
+        _phase: Phase,
+    ) {
         // reject preempted ballot within the proposer
         self.proposer.receive_reject(node, proposed, promised);
         self.forward();
     }
 
-    fn accepted(&mut self, node: NodeId, bal: Ballot, slots: Vec<Slot>) {
+    fn accepted(&mut self, node: NodeId, slot: Slot, bal: Ballot) {
         self.proposer.observe_ballot(bal);
 
         // notify each slot of the accepted, collecting resolutions
-        let mut resolutions = Vec::with_capacity(slots.len());
-        for slot in slots {
-            match self.window.slot_mut(slot) {
-                SlotMutRef::Open(ref mut open_ref) => {
-                    open_ref.acceptor().receive_accepted(node, bal);
-                    open_ref
-                        .acceptor()
-                        .resolution()
-                        .into_iter()
-                        .for_each(|res| resolutions.push((slot, res.1)));
-                }
-                SlotMutRef::Empty(_) => {
-                    warn!("Received accepted() for slot {} which is unknown", slot);
-                }
-                _ => return,
+        let resolution = match self.window.slot_mut(slot) {
+            SlotMutRef::Open(ref mut open_ref) => {
+                open_ref.acceptor().receive_accepted(node, bal);
+                open_ref.acceptor().resolution().map(|(_, value)| value)
             }
-        }
+            SlotMutRef::Empty(_) => {
+                warn!("Received accepted() for slot {} which is unknown", slot);
+                None
+            }
+            _ => None,
+        };
 
-        if !resolutions.is_empty() {
-            resolutions.shrink_to_fit();
-            self.broadcast(Command::Resolution(bal, resolutions));
+        if let Some(value) = resolution {
+            self.broadcast_at(
+                slot,
+                bal,
+                Phase::Resolution,
+                Command::Resolution { slot, ballot: bal, value },
+            );
         }
     }
 
-    fn resolution(&mut self, bal: Ballot, slot_vals: Vec<(Slot, Bytes)>) {
+    fn resolution(&mut self, slot: Slot, bal: Ballot, val: Bytes) {
         self.proposer.observe_ballot(bal);
 
-        for (slot, val) in slot_vals.into_iter() {
-            match self.window.slot_mut(slot) {
-                SlotMutRef::Empty(empty_slot) => empty_slot.fill().acceptor().resolve(bal, val),
-                SlotMutRef::Open(ref mut open) => open.acceptor().resolve(bal, val),
-                _ => {}
-            }
+        match self.window.slot_mut(slot) {
+            SlotMutRef::Empty(empty_slot) => empty_slot.fill().acceptor().resolve(bal, val),
+            SlotMutRef::Open(ref mut open) => open.acceptor().resolve(bal, val),
+            _ => {}
         }
 
         // Send catchup for holds in the decision making
@@ -295,58 +453,80 @@ impl<T: Transport> Commander for Node<T> {
             trace!("Sending catchup for slots {:?}", slots);
             let leader = self.proposer.highest_observed_ballot().unwrap().1;
             let node = self.config.current();
-            self.send(leader, Command::Catchup(node, slots));
+            for slot in slots {
+                self.send_at(
+                    leader,
+                    slot,
+                    bal,
+                    Phase::Catchup,
+                    Command::Catchup { from: node, slot },
+                );
+            }
         }
     }
 
-    fn catchup(&mut self, node: NodeId, mut slots: Vec<Slot>) {
+    fn catchup(&mut self, node: NodeId, slot: Slot) {
         // TODO: do we want to redirect at this point? Dropping is certainly safer
         if !self.is_leader() {
             return;
         }
 
-        slots.sort();
+        let resolved = match self.window.slot_mut(slot) {
+            SlotMutRef::Resolved(bal, val) => Some((bal, val)),
+            _ => None,
+        };
 
-        let mut buf = Vec::with_capacity(slots.len());
-        let mut run_bal: Option<Ballot> = None;
-
-        for slot in slots.into_iter() {
-            if let SlotMutRef::Resolved(bal, val) = self.window.slot_mut(slot) {
-                // if we hit a run with a different ballot, send the resolutions we have so far
-                if let Some(b) = run_bal {
-                    if b != bal && !buf.is_empty() {
-                        let next_buf_cap = buf.capacity().saturating_sub(buf.len());
-                        let send_buf = mem::replace(&mut buf, Vec::with_capacity(next_buf_cap));
-                        self.transport.send(
-                            node,
-                            &self.config[node],
-                            Command::Resolution(b, send_buf),
-                        );
-                    }
-                }
-
-                run_bal = Some(bal);
-                buf.push((slot, val));
-            }
-        }
-
-        if !buf.is_empty() && run_bal.is_some() {
-            self.send(node, Command::Resolution(run_bal.unwrap(), buf));
+        if let Some((bal, val)) = resolved {
+            self.send_at(
+                node,
+                slot,
+                bal,
+                Phase::Resolution,
+                Command::Resolution { slot, ballot: bal, value: val },
+            );
         }
     }
 }
 
-impl<T: Transport> Replica for Node<T> {
+impl<T> Replica for Node<T>
+where
+    T: RoundTransport<PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+{
     fn propose_leadership(&mut self) {
         match *self.proposer.state() {
-            ProposerState::Candidate { proposal, .. } => self.broadcast(Command::Prepare(proposal)),
+            ProposerState::Candidate { proposal, .. } => {
+                for slot in self.window.open_range().collect::<Vec<_>>() {
+                    self.broadcast_at(
+                        slot,
+                        proposal,
+                        Phase::Prepare,
+                        Command::Prepare { slot, ballot: proposal },
+                    );
+                }
+            }
             ProposerState::Follower => {
                 let bal = self.proposer.prepare();
-                self.broadcast(Command::Prepare(bal));
+                for slot in self.window.open_range().collect::<Vec<_>>() {
+                    self.broadcast_at(
+                        slot,
+                        bal,
+                        Phase::Prepare,
+                        Command::Prepare { slot, ballot: bal },
+                    );
+                }
             }
             ProposerState::Leader { proposal } => {
                 // TODO: do we want a special sync here? What about periodic bumping ballot?
-                self.broadcast(Command::Accept(proposal, vec![]));
+                for slot in self.window.open_range().collect::<Vec<_>>() {
+                    self.broadcast_at(
+                        slot,
+                        proposal,
+                        Phase::Accept,
+                        Command::Accept { slot, ballot: proposal, value: Bytes::default() },
+                    );
+                }
             }
         }
     }
@@ -355,7 +535,9 @@ impl<T: Transport> Replica for Node<T> {
         self.proposer.state().is_leader()
     }
 
-    fn tick(&mut self) {}
+    fn tick(&mut self) {
+        let _ = self.comm.rounds().tick();
+    }
 
     fn decisions(&self) -> DecisionSet {
         self.window.decisions()
@@ -363,430 +545,13 @@ impl<T: Transport> Replica for Node<T> {
 }
 
 #[cfg(test)]
-mod tests {
+mod comm_tests {
     use super::*;
-    use crate::NodeMetadata;
-    use lazy_static::lazy_static;
-    use std::ops::Index;
-
-    lazy_static! {
-        static ref CONFIG: Configuration = Configuration::new(
-            4u32,
-            vec![
-                (0, NodeMetadata::default()),
-                (1, NodeMetadata::default()),
-                (2, NodeMetadata::default()),
-                (3, NodeMetadata::default()),
-            ]
-            .into_iter(),
-        );
-    }
-
-    #[test]
-    fn node_proposal() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-
-        // sent with no existing proposal, kickstarts phase 1
-        replica.proposal("123".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        assert_eq!(&[Command::Prepare(Ballot(0, 4))], &replica.transport[0]);
-        assert_eq!(&[Command::Prepare(Ballot(0, 4))], &replica.transport[1]);
-        assert_eq!(&[Command::Prepare(Ballot(0, 4))], &replica.transport[2]);
-        assert_eq!(&[Command::Prepare(Ballot(0, 4))], &replica.transport[3]);
-        replica.transport.clear();
-
-        replica.proposal("456".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        assert!(replica.transport[0].is_empty());
-        assert!(replica.transport[1].is_empty());
-        assert!(replica.transport[2].is_empty());
-        assert!(replica.transport[3].is_empty());
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_proposal_redirection() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.prepare(Ballot(0, 3));
-        assert_eq!(Some(Ballot(0, 3)), replica.proposer.highest_observed_ballot());
-        replica.transport.clear();
-
-        replica.proposal("123".into());
-        assert!(replica.transport[0].is_empty());
-        assert!(replica.transport[1].is_empty());
-        assert!(replica.transport[2].is_empty());
-        assert_eq!(&[Command::Proposal("123".into())], &replica.transport[3]);
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_prepare() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-
-        replica.prepare(Ballot(1, 0));
-        assert_eq!(Some(Ballot(1, 0)), replica.proposer.highest_observed_ballot());
-        assert_eq!(&[Command::Promise(4, Ballot(1, 0), Vec::new())], &replica.transport[0]);
-        assert!(&replica.transport[1].is_empty());
-        assert!(&replica.transport[2].is_empty());
-        assert!(&replica.transport[3].is_empty());
-        replica.transport.clear();
-
-        replica.prepare(Ballot(0, 2));
-        assert_eq!(Some(Ballot(1, 0)), replica.proposer.highest_observed_ballot());
-        assert!(&replica.transport[0].is_empty());
-        assert!(&replica.transport[1].is_empty());
-        assert_eq!(&[Command::Reject(4, Ballot(0, 2), Ballot(1, 0))], &replica.transport[2]);
-        assert!(&replica.transport[3].is_empty());
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_promise_without_existing_accepted_value() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.proposal("123".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        replica.transport.clear();
-
-        // replica needs 2 more promises to achieve Phase 1 Quorum
-        replica.promise(0, Ballot(0, 4), Vec::new());
-        (0..4).for_each(|i| assert!(replica.transport[i].is_empty()));
-
-        replica.promise(2, Ballot(0, 4), Vec::new());
-
-        (0..4).for_each(|i| {
-            assert_eq!(
-                &[Command::Accept(Ballot(0, 4), vec![(0, "123".into())])],
-                &replica.transport[i]
-            )
-        });
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_promise_with_existing_accepted_value() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.proposal("123".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        replica.transport.clear();
-
-        // replica needs 2 more promises to achieve Phase 1 Quorum
-        replica.promise(1, Ballot(0, 4), vec![(0, Ballot(0, 0), "456".into())]);
-        (0..4).for_each(|i| assert!(replica.transport[i].is_empty()));
-
-        replica.promise(2, Ballot(0, 4), vec![]);
-
-        (0..4).for_each(|i| {
-            assert_eq!(
-                &[Command::Accept(Ballot(0, 4), vec![(0, "456".into()), (1, "123".into())])],
-                &replica.transport[i]
-            )
-        });
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_promise_with_slot_holes() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.proposal("123".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        replica.transport.clear();
-
-        // replica needs 2 more promises to achieve Phase 1 Quorum
-        replica.promise(1, Ballot(0, 4), vec![(2, Ballot(0, 0), "456".into())]);
-        (0..4).for_each(|i| assert!(replica.transport[i].is_empty()));
-
-        replica.promise(2, Ballot(0, 4), vec![]);
-
-        (0..4).for_each(|i| {
-            assert_eq!(
-                &[Command::Accept(
-                    Ballot(0, 4),
-                    vec![
-                        (0, Bytes::default()),
-                        (1, Bytes::default()),
-                        (2, "456".into()),
-                        (3, "123".into())
-                    ]
-                )],
-                &replica.transport[i]
-            );
-        });
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_accept() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.prepare(Ballot(8, 2));
-        assert_eq!(Some(Ballot(8, 2)), replica.proposer.highest_observed_ballot());
-        replica.transport.clear();
-
-        // test rejection first for bal < proposer.highest_observed_ballot
-        replica.accept(Ballot(1, 1), vec![(0, "123".into())]);
-        assert_eq!(&[Command::Reject(4, Ballot(1, 1), Ballot(8, 2))], &replica.transport[1]);
-        replica.transport.clear();
-
-        // test replying with accepted message when bal =
-        // proposer.highest_observed_ballot
-        replica.accept(Ballot(8, 2), vec![(0, "456".into())]);
-        assert_eq!(Some(Ballot(8, 2)), replica.proposer.highest_observed_ballot());
-        assert_eq!(&[Command::Accepted(4, Ballot(8, 2), vec![0])], &replica.transport[2]);
-        replica.transport.clear();
-
-        // test replying with accepted message when bal >
-        // proposer.highest_observed_ballot
-        replica.accept(Ballot(9, 2), vec![(0, "789".into())]);
-        assert_eq!(Some(Ballot(9, 2)), replica.proposer.highest_observed_ballot());
-        assert_eq!(&[Command::Accepted(4, Ballot(9, 2), vec![0])], &replica.transport[2]);
-
-        assert!(replica.window.decisions().is_empty());
-        replica.transport.clear();
-
-        // try with multiple accepts
-        replica.accept(Ballot(10, 2), vec![(1, "foo".into()), (2, "bar".into())]);
-        assert_eq!(Some(Ballot(10, 2)), replica.proposer.highest_observed_ballot());
-        assert_eq!(&[Command::Accepted(4, Ballot(10, 2), vec![1, 2])], &replica.transport[2]);
-    }
-
-    #[test]
-    fn node_reject() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.proposal("123".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        replica.transport.clear();
-
-        replica.reject(2, Ballot(0, 4), Ballot(5, 3));
-        assert_eq!(Some(Ballot(5, 3)), replica.proposer.highest_observed_ballot());
-        assert!(replica.proposer.state().is_follower());
-        assert_eq!(&[Command::Proposal("123".into())], &replica.transport[3]);
-        (0..3).for_each(|i| assert!(replica.transport[i].is_empty()));
-
-        assert!(replica.window.decisions().is_empty());
-    }
-
-    #[test]
-    fn node_accepted() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        replica.proposal("123".into());
-        assert_eq!(Some(Ballot(0, 4)), replica.proposer.highest_observed_ballot());
-        replica.promise(1, Ballot(0, 4), vec![]);
-        replica.promise(0, Ballot(0, 4), vec![]);
-        replica.promise(2, Ballot(0, 4), vec![]);
-        replica.transport.clear();
-
-        // wait for phase 2 quorum (accepted) before sending resolution
-        replica.accepted(0, Ballot(0, 4), vec![0]);
-        (0..4).for_each(|i| assert!(replica.transport[i].is_empty()));
-
-        replica.accepted(2, Ballot(0, 4), vec![0]);
-        (0..4).for_each(|i| {
-            assert_eq!(
-                &[Command::Resolution(Ballot(0, 4), vec![(0, "123".into())])],
-                &replica.transport[i]
-            )
-        });
-
-        assert_eq!(vec![(0, "123".into())], replica.window.decisions().iter().collect::<Vec<_>>());
-
-        // allow multiple accepted slots
-        replica.proposal("foo".into());
-        replica.proposal("bar".into());
-        replica.transport.clear();
-        replica.accepted(0, Ballot(0, 4), vec![1, 2]);
-        (0..4).for_each(|i| assert!(replica.transport[i].is_empty()));
-        replica.accepted(1, Ballot(0, 4), vec![1, 2]);
-
-        (0..4).for_each(|i| {
-            assert_eq!(
-                &[Command::Resolution(Ballot(0, 4), vec![(1, "foo".into()), (2, "bar".into())])],
-                &replica.transport[i]
-            )
-        });
-
-        assert_eq!(
-            vec![(0, "123".into()), (1, "foo".into()), (2, "bar".into())],
-            replica.window.decisions().iter().collect::<Vec<_>>()
-        );
-
-        // allow multiple accepts, but only when the slots receive quorum!
-        replica.proposal("foo2".into());
-        replica.proposal("bar2".into());
-        replica.transport.clear();
-        replica.accepted(0, Ballot(0, 4), vec![3, 4]);
-        (0..4).for_each(|i| assert!(replica.transport[i].is_empty()));
-        replica.accepted(1, Ballot(0, 4), vec![3]);
-
-        (0..4).for_each(|i| {
-            assert_eq!(
-                &[Command::Resolution(Ballot(0, 4), vec![(3, "foo2".into())])],
-                &replica.transport[i]
-            )
-        });
-
-        assert_eq!(
-            vec![(0, "123".into()), (1, "foo".into()), (2, "bar".into()), (3, "foo2".into())],
-            replica.window.decisions().iter().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn node_resolution() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-
-        replica.resolution(Ballot(1, 2), vec![(4, "123".into())]);
-        assert_eq!((0..5), replica.window.open_range());
-        assert!(match replica.window.slot_mut(4) {
-            SlotMutRef::Resolved(Ballot(1, 2), val) if val == "123" => true,
-            _ => false,
-        });
-        assert_eq!(&[Command::Catchup(4, vec![0, 1, 2, 3])], &replica.transport[2]);
-        replica.transport.clear();
-
-        replica.resolution(Ballot(1, 2), vec![(1, Bytes::default()), (0, "000".into())]);
-        assert_eq!(
-            vec![(0, "000".into()), (1, Bytes::default())],
-            replica.window.decisions().iter().collect::<Vec<_>>()
-        );
-        assert_eq!(&[Command::Catchup(4, vec![2, 3])], &replica.transport[2]);
-        replica.transport.clear();
-
-        // fill hole 1,2
-        replica.resolution(Ballot(1, 2), vec![(2, Bytes::default()), (3, "3".into())]);
-        assert!(replica.transport[2].is_empty());
-
-        assert_eq!(
-            vec![
-                (0, "000".into()),
-                (1, Bytes::default()),
-                (2, Bytes::default()),
-                (3, "3".into()),
-                (4, "123".into())
-            ],
-            replica.window.decisions().iter().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn node_is_leader() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        assert!(!replica.is_leader());
-
-        let bal = replica.proposer.prepare();
-        assert!(!replica.is_leader());
-
-        replica.promise(0, bal, vec![]);
-        assert!(!replica.is_leader());
-
-        replica.promise(1, bal, vec![]);
-        assert!(replica.is_leader());
-    }
-
-    #[test]
-    fn node_propose_leadership_as_follower() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        assert!(!replica.is_leader());
-        replica.propose_leadership();
-
-        (0..4).for_each(|i| assert_eq!(&[Command::Prepare(Ballot(0, 4))], &replica.transport[i]));
-    }
-
-    #[test]
-    fn node_propose_leadership_as_candidate() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        assert!(!replica.is_leader());
-        replica.propose_leadership();
-        replica.transport.clear();
-
-        replica.propose_leadership();
-        (0..4).for_each(|i| assert_eq!(&[Command::Prepare(Ballot(0, 4))], &replica.transport[i]));
-    }
-
-    #[test]
-    fn node_propose_leadership_as_leader() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        assert!(!replica.is_leader());
-        replica.propose_leadership();
-        replica.promise(0, Ballot(0, 4), vec![]);
-        replica.promise(1, Ballot(0, 4), vec![]);
-        assert!(replica.is_leader());
-        replica.transport.clear();
-
-        replica.propose_leadership();
-        (0..4).for_each(|i| {
-            assert_eq!(&[Command::Accept(Ballot(0, 4), vec![])], &replica.transport[i])
-        });
-    }
-
-    #[test]
-    fn node_catchup() {
-        let mut replica = Node::new(VecTransport::default(), CONFIG.clone());
-        // put in some slots
-        // 0, 1, 2 are resolved
-        let resolved_slots = vec![
-            (Ballot(0, 1), "123".into()),
-            (Ballot(0, 1), "456".into()),
-            (Ballot(2, 1), "abc".into()),
-        ];
-        for (bal, val) in resolved_slots {
-            replica.window.next_slot().acceptor().resolve(bal, val);
-        }
-
-        // slot 3 is still open
-        {
-            replica.window.next_slot().acceptor().receive_accept(Ballot(2, 1), "xyz".into());
-        }
-
-        // replica that is not the leader cannot respond to catchup
-        replica.catchup(2, vec![0, 1, 2]);
-        assert!(replica.transport[2].is_empty());
-
-        // make the replica the leader
-        assert!(!replica.is_leader());
-        replica.propose_leadership();
-        (0..=1).for_each(|n| replica.promise(n, Ballot(0, 4), vec![]));
-        replica.promise(1, Ballot(0, 4), vec![]);
-        assert!(replica.is_leader());
-        replica.transport.clear();
-
-        // request catch up for non-closed slots
-        replica.catchup(2, vec![3, 4, 5]);
-        assert!(replica.transport[2].is_empty());
-
-        // request catchup for open slots
-        replica.catchup(2, vec![0, 1, 2, 3]);
-        assert_eq!(
-            &[
-                Command::Resolution(Ballot(0, 1), vec![(0, "123".into()), (1, "456".into())]),
-                Command::Resolution(Ballot(2, 1), vec![(2, "abc".into())])
-            ],
-            &replica.transport[2]
-        );
-
-        // resolutions must come in order
-        replica.catchup(0, vec![2, 0, 1, 3]);
-        assert_eq!(
-            &[
-                Command::Resolution(Ballot(0, 1), vec![(0, "123".into()), (1, "456".into())]),
-                Command::Resolution(Ballot(2, 1), vec![(2, "abc".into())])
-            ],
-            &replica.transport[0]
-        );
-
-        // resolutions can contain holes
-        replica.catchup(3, vec![1, 2]);
-        assert_eq!(
-            &[
-                Command::Resolution(Ballot(0, 1), vec![(1, "456".into())]),
-                Command::Resolution(Ballot(2, 1), vec![(2, "abc".into())])
-            ],
-            &replica.transport[3]
-        );
+    use std::{convert::Infallible, ops::Index};
+    use traceforge_rounds::Envelope;
+
+    fn config() -> Configuration<NodeId> {
+        Configuration::new(4u32, vec![(0, 0), (1, 1), (2, 2), (3, 3)].into_iter())
     }
 
     #[derive(Default)]
@@ -802,16 +567,152 @@ mod tests {
 
     impl Index<usize> for VecTransport {
         type Output = [Command];
+
         fn index(&self, n: usize) -> &[Command] {
             assert!(n < 4);
             &self.0[n]
         }
     }
 
-    impl Transport for VecTransport {
-        fn send(&mut self, node: NodeId, _: &NodeMetadata, cmd: Command) {
-            assert!(node < 4);
-            self.0[node as usize].push(cmd);
+    impl RoundTransport<PaxosRound, Command> for VecTransport {
+        type Node = NodeId;
+        type Error = Infallible;
+
+        fn send(
+            &mut self,
+            dst: Self::Node,
+            envelope: Envelope<PaxosRound, Command>,
+        ) -> Result<(), Self::Error> {
+            assert!(dst < 4);
+            let (_, msg) = envelope.into_parts();
+            self.0[dst as usize].push(msg);
+            Ok(())
         }
+
+        fn recv<F>(
+            &mut self,
+            _current: &PaxosRound,
+            _filter: F,
+        ) -> Result<Option<Envelope<PaxosRound, Command>>, Self::Error>
+        where
+            F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
+        {
+            Ok(None)
+        }
+
+        fn recv_block<F>(
+            &mut self,
+            _current: &PaxosRound,
+            _filter: F,
+        ) -> Result<Envelope<PaxosRound, Command>, Self::Error>
+        where
+            F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
+        {
+            unreachable!("VecTransport has no blocking receive queue")
+        }
+
+        fn inbox<F>(
+            &mut self,
+            _current: &PaxosRound,
+            _filter: F,
+            _min: usize,
+            _max: Option<usize>,
+        ) -> Result<Vec<Option<Envelope<PaxosRound, Command>>>, Self::Error>
+        where
+            F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn proposal_starts_prepare_round() {
+        let mut replica = Node::new(VecTransport::default(), config());
+
+        replica.proposal("123".into());
+
+        let expected = Command::Prepare { slot: 0, ballot: Ballot(0, 4) };
+        for node in 0..4 {
+            assert_eq!(&[expected.clone()], &replica.comm.transport()[node]);
+        }
+        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Prepare));
+    }
+
+    #[test]
+    fn promise_quorum_drives_one_slot_accept() {
+        let mut replica = Node::new(VecTransport::default(), config());
+        replica.proposal("123".into());
+        replica.comm.transport_mut().clear();
+
+        replica.promise(0, 0, Ballot(0, 4), None);
+        for node in 0..4 {
+            assert!(replica.comm.transport()[node].is_empty());
+        }
+
+        replica.promise(2, 0, Ballot(0, 4), None);
+        let expected = Command::Accept { slot: 0, ballot: Ballot(0, 4), value: "123".into() };
+        for node in 0..4 {
+            assert_eq!(&[expected.clone()], &replica.comm.transport()[node]);
+        }
+        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Accept));
+    }
+
+    #[test]
+    fn accepted_quorum_broadcasts_resolution() {
+        let mut replica = Node::new(VecTransport::default(), config());
+        replica.proposal("123".into());
+        replica.promise(1, 0, Ballot(0, 4), None);
+        replica.promise(2, 0, Ballot(0, 4), None);
+        replica.comm.transport_mut().clear();
+
+        replica.accepted(0, 0, Ballot(0, 4));
+        for node in 0..4 {
+            assert!(replica.comm.transport()[node].is_empty());
+        }
+
+        replica.accepted(2, 0, Ballot(0, 4));
+        let expected = Command::Resolution { slot: 0, ballot: Ballot(0, 4), value: "123".into() };
+        for node in 0..4 {
+            assert_eq!(&[expected.clone()], &replica.comm.transport()[node]);
+        }
+        assert_eq!(vec![(0, "123".into())], replica.window.decisions().iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resolution_requests_catchup_per_missing_slot() {
+        let mut replica = Node::new(VecTransport::default(), config());
+
+        replica.resolution(4, Ballot(1, 2), "123".into());
+
+        for slot in 0..4 {
+            assert_eq!(
+                replica.comm.transport()[2][slot as usize],
+                Command::Catchup { from: 4, slot }
+            );
+        }
+    }
+
+    #[test]
+    fn stamped_proposal_does_not_import_envelope_round() {
+        let mut replica = Node::new(VecTransport::default(), config());
+
+        replica.receive_stamped(
+            PaxosRound::new(7, 3, Phase::Resolution),
+            Command::Proposal("123".into()),
+        );
+
+        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Prepare));
+    }
+
+    #[test]
+    fn stamped_catchup_does_not_import_envelope_round() {
+        let mut replica = Node::new(VecTransport::default(), config());
+
+        replica.receive_stamped(
+            PaxosRound::new(7, 3, Phase::Catchup),
+            Command::Catchup { from: 1, slot: 7 },
+        );
+
+        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Prepare));
     }
 }

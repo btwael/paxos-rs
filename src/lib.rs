@@ -13,7 +13,7 @@
 //! # use bytes::Bytes;
 //!
 //! # fn main() {
-//! let config = Configuration::new(
+//! let config: Configuration = Configuration::new(
 //!     0u32,
 //!     vec![(1, Bytes::from("127.0.0.1:4001").into()),
 //!          (2, Bytes::from("127.0.0.1:4002").into())].into_iter());
@@ -34,14 +34,16 @@ mod config;
 pub mod liveness;
 mod node;
 mod proposer;
+pub mod round;
 pub mod statemachine;
 mod window;
 
 use std::cmp;
 
-pub use commands::{Command, Receiver, Transport};
+pub use commands::{Command, Receiver};
 pub use config::{Configuration, NodeMetadata};
 pub use node::Node;
+pub use round::{PaxosRound, Phase};
 use serde::{Deserialize, Serialize};
 pub use statemachine::ReplicatedState;
 use std::marker::Sized;

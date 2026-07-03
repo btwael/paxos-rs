@@ -1,0 +1,11 @@
+[package]
+name = "traceforge-paxos"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+bytes = { version = "1.11.1", features = ["serde"] }
+paxos = { path = "../.." }
+paxos-example-support = { path = "../paxos-example-support" }
+traceforge = { path = "../../../TraceForge/traceforge" }
+traceforge-rounds = { path = "../../../TraceForge/traceforge-rounds" }

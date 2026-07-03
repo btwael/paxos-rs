@@ -1,0 +1,18 @@
+[package]
+name = "http-paxos-rounds"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+bincode = "1.3"
+bytes = { version = "1.11.1", features = ["serde"] }
+env_logger = "0.11.5"
+futures-util = "0.3"
+hyper = { version = "0.14.30", features = ["client", "server", "http1", "tcp"] }
+log = "0.4"
+paxos = { path = "../.." }
+paxos-example-support = { path = "../paxos-example-support" }
+rand = "0.9.2"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.27", features = ["rt", "time", "macros", "sync"] }
+traceforge-rounds = { path = "../../../TraceForge/traceforge-rounds" }

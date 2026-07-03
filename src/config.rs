@@ -20,18 +20,18 @@ impl Into<Bytes> for NodeMetadata {
 
 /// Configuration holds the state of the membership of the cluster.
 #[derive(Clone)]
-pub struct Configuration {
+pub struct Configuration<N = NodeMetadata> {
     current: NodeId,
-    peers: HashMap<NodeId, NodeMetadata>,
+    peers: HashMap<NodeId, N>,
 }
 
-impl Configuration {
+impl<N> Configuration<N> {
     /// Creates a new configuration
-    pub fn new<I>(current: NodeId, peers: I) -> Configuration
+    pub fn new<I>(current: NodeId, peers: I) -> Configuration<N>
     where
-        I: Iterator<Item = (NodeId, NodeMetadata)>,
+        I: Iterator<Item = (NodeId, N)>,
     {
-        let peers: HashMap<NodeId, NodeMetadata> = peers.collect();
+        let peers: HashMap<NodeId, N> = peers.collect();
         Configuration { current, peers }
     }
 
@@ -53,19 +53,19 @@ impl Configuration {
     }
 
     /// Iterator containing all nodes along with their metadata
-    pub fn peers<'a>(&'a self) -> impl Iterator<Item = (NodeId, &NodeMetadata)> + 'a {
+    pub fn peers<'a>(&'a self) -> impl Iterator<Item = (NodeId, &N)> + 'a {
         self.peers.iter().map(|(id, meta)| (*id, meta))
     }
 }
 
-impl Index<NodeId> for Configuration {
-    type Output = NodeMetadata;
-    fn index(&self, node: NodeId) -> &NodeMetadata {
+impl<N> Index<NodeId> for Configuration<N> {
+    type Output = N;
+    fn index(&self, node: NodeId) -> &N {
         &self.peers[&node]
     }
 }
 
-impl fmt::Debug for Configuration {
+impl<N: fmt::Debug> fmt::Debug for Configuration<N> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let (p1_q, p2_q) = self.quorum_size();
         fmt.debug_struct("Configuration")
