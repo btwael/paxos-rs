@@ -1,6 +1,6 @@
 use crate::NodeId;
 use bytes::Bytes;
-use std::{collections::HashMap, fmt, ops::Index};
+use std::{collections::BTreeMap, fmt, ops::Index};
 
 #[derive(Default, Clone, Debug, Eq, PartialEq)]
 /// Opaque, applicaiton specific metadata for nodes in the system
@@ -22,7 +22,7 @@ impl Into<Bytes> for NodeMetadata {
 #[derive(Clone)]
 pub struct Configuration<N = NodeMetadata> {
     current: NodeId,
-    peers: HashMap<NodeId, N>,
+    peers: BTreeMap<NodeId, N>,
 }
 
 impl<N> Configuration<N> {
@@ -31,7 +31,7 @@ impl<N> Configuration<N> {
     where
         I: Iterator<Item = (NodeId, N)>,
     {
-        let peers: HashMap<NodeId, N> = peers.collect();
+        let peers: BTreeMap<NodeId, N> = peers.collect();
         Configuration { current, peers }
     }
 

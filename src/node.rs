@@ -3,15 +3,15 @@ use crate::{
     acceptor::{AcceptResponse, PrepareResponse},
     commands::*,
     proposer::{Proposer, ProposerState},
-    round::{PaxosRound, Phase},
+    round::{PaxosKey, PaxosRound, Phase},
     window::{DecisionSet, SlotMutRef, SlotWindow},
 };
 use bytes::Bytes;
-use traceforge_rounds::{Comm, CommError, Transport as RoundTransport};
+use traceforge_rounds::set::{SetComm, SetCommError, SetTransport};
 
 /// State manager for multi-paxos group
-pub struct Node<T: RoundTransport<PaxosRound, Command>> {
-    comm: Comm<PaxosRound, T>,
+pub struct Node<T: SetTransport<PaxosKey, PaxosRound, Command>> {
+    comm: SetComm<PaxosKey, PaxosRound, T>,
     config: Configuration<T::Node>,
     proposer: Proposer,
     window: SlotWindow,
@@ -19,12 +19,15 @@ pub struct Node<T: RoundTransport<PaxosRound, Command>> {
 
 impl<T> Node<T>
 where
-    T: RoundTransport<PaxosRound, Command>,
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
     T::Node: Clone,
     T::Error: std::fmt::Debug,
 {
     /// Node creation from a sender and starting configuration
-    pub fn with_comm(comm: Comm<PaxosRound, T>, config: Configuration<T::Node>) -> Node<T> {
+    pub fn with_comm(
+        comm: SetComm<PaxosKey, PaxosRound, T>,
+        config: Configuration<T::Node>,
+    ) -> Node<T> {
         let (p1_quorum, p2_quorum) = config.quorum_size();
         let node = config.current();
         Node {
@@ -37,14 +40,14 @@ where
 
     /// Node creation from a transport and starting configuration.
     pub fn new(transport: T, config: Configuration<T::Node>) -> Node<T> {
-        Self::with_comm(Comm::new(transport), config)
+        Self::with_comm(SetComm::new(transport), config)
     }
 
-    pub fn comm(&self) -> &Comm<PaxosRound, T> {
+    pub fn comm(&self) -> &SetComm<PaxosKey, PaxosRound, T> {
         &self.comm
     }
 
-    pub fn comm_mut(&mut self) -> &mut Comm<PaxosRound, T> {
+    pub fn comm_mut(&mut self) -> &mut SetComm<PaxosKey, PaxosRound, T> {
         &mut self.comm
     }
 
@@ -52,18 +55,30 @@ where
         self.config.current()
     }
 
-    pub fn current_round(&mut self) -> PaxosRound {
-        self.comm.rounds().current().clone()
+    pub fn current_round(&mut self, key: PaxosKey) -> PaxosRound {
+        self.comm.on(key).rounds().current().clone()
+    }
+
+    pub fn open_slots(&self) -> Vec<Slot> {
+        self.window.open_range().collect()
+    }
+
+    pub fn participant_node_ids(&self) -> Vec<NodeId> {
+        let mut nodes = self.config.peer_node_ids().collect::<Vec<_>>();
+        nodes.push(self.config.current());
+        nodes.sort_unstable();
+        nodes
     }
 
     pub fn highest_observed_ballot(&self) -> Option<Ballot> {
         self.proposer.highest_observed_ballot()
     }
 
-    fn enter_round(&mut self, slot: Slot, ballot: Ballot, phase: Phase) {
+    fn enter_round(&mut self, key: PaxosKey, ballot: Ballot, phase: Phase) {
         self.comm
+            .on(key)
             .rounds()
-            .jump(PaxosRound::new(slot, ballot.0, phase))
+            .jump(PaxosRound::new(ballot.0, phase))
             .expect("round movement must not move to the past");
     }
 
@@ -128,39 +143,73 @@ where
 
         let proposals = self.proposer.take_proposals();
         if let Some(Ballot(_, node)) = self.proposer.highest_observed_ballot() {
+            if node == self.config.current() {
+                for proposal in proposals {
+                    self.proposer.push_proposal(proposal);
+                }
+                return;
+            }
             for proposal in proposals.into_iter() {
                 self.send(node, Command::Proposal(proposal));
             }
         }
     }
 
+    fn observe_ballot_and_forward(&mut self, ballot: Ballot) {
+        self.proposer.observe_ballot(ballot);
+        self.forward();
+    }
+
     #[inline(always)]
     fn send(&mut self, node: NodeId, cmd: Command) {
+        assert_ne!(
+            node,
+            self.config.current(),
+            "attempted to send command to self through peer transport: {:?}",
+            cmd
+        );
         let dst = self.config[node].clone();
-        self.comm.send(dst, cmd).expect("transport send failed");
+        let key = cmd.key_for(node);
+        self.comm.on(key).send(dst, cmd).expect("transport send failed");
     }
 
     #[inline(always)]
     fn send_at(&mut self, node: NodeId, slot: Slot, ballot: Ballot, phase: Phase, cmd: Command) {
-        self.enter_round(slot, ballot, phase);
+        self.enter_round(PaxosKey::Slot { slot, proposer: ballot.1 }, ballot, phase);
+        self.send(node, cmd);
+    }
+
+    #[inline(always)]
+    fn send_catchup_at(&mut self, node: NodeId, slot: Slot, ballot: Ballot, cmd: Command) {
+        if node == self.config.current() {
+            return;
+        }
+        self.enter_round(PaxosKey::Catchup { slot, leader: node }, ballot, Phase::Catchup);
         self.send(node, cmd);
     }
 
     #[inline(always)]
     fn broadcast_at(&mut self, slot: Slot, ballot: Ballot, phase: Phase, cmd: Command) {
-        self.enter_round(slot, ballot, phase);
+        self.enter_round(PaxosKey::Slot { slot, proposer: ballot.1 }, ballot, phase);
         for node in self.config.peer_node_ids().collect::<Vec<_>>() {
             self.send(node, cmd.clone());
         }
     }
 
-    pub fn receive_stamped(&mut self, round: PaxosRound, cmd: Command) {
-        if let Some(protocol_round) = cmd.protocol_round() {
+    pub fn receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) {
+        assert_eq!(
+            key,
+            cmd.key_for(self.config.current()),
+            "transport key must match the command's Paxos key for this receiver"
+        );
+        if let Some((protocol_key, protocol_round)) = cmd.protocol_stamp() {
+            assert_eq!(key, protocol_key, "transport key must match the command's Paxos key");
             assert_eq!(
                 round, protocol_round,
                 "transport stamp must match the command's Paxos round"
             );
             self.comm
+                .on(key)
                 .rounds()
                 .jump(round)
                 .expect("received stamped command must not move to the past");
@@ -174,17 +223,17 @@ where
         ballot: Ballot,
         min: usize,
         max: usize,
-    ) -> Result<usize, CommError<PaxosRound, Command, T::Error>>
+    ) -> Result<usize, SetCommError<PaxosKey, PaxosRound, Command, T::Error>>
     where
         Command: 'static,
     {
-        self.enter_round(slot, ballot, Phase::Promise);
-        let messages = self.comm.inbox_with_bounds_with::<Command, _>(
+        let key = PaxosKey::Slot { slot, proposer: ballot.1 };
+        self.enter_round(key, ballot, Phase::Promise);
+        let messages = self.comm.on(key).inbox_with_bounds_with::<Command, _>(
             min,
             Some(max),
             move |local, remote| {
-                local.slot() == remote.slot()
-                    && local.ballot() == remote.ballot()
+                local.ballot() == remote.ballot()
                     && local.phase() == Phase::Promise
                     && remote.phase() == Phase::Promise
             },
@@ -206,17 +255,17 @@ where
         ballot: Ballot,
         min: usize,
         max: usize,
-    ) -> Result<usize, CommError<PaxosRound, Command, T::Error>>
+    ) -> Result<usize, SetCommError<PaxosKey, PaxosRound, Command, T::Error>>
     where
         Command: 'static,
     {
-        self.enter_round(slot, ballot, Phase::Accepted);
-        let messages = self.comm.inbox_with_bounds_with::<Command, _>(
+        let key = PaxosKey::Slot { slot, proposer: ballot.1 };
+        self.enter_round(key, ballot, Phase::Accepted);
+        let messages = self.comm.on(key).inbox_with_bounds_with::<Command, _>(
             min,
             Some(max),
             move |local, remote| {
-                local.slot() == remote.slot()
-                    && local.ballot() == remote.ballot()
+                local.ballot() == remote.ballot()
                     && local.phase() == Phase::Accepted
                     && remote.phase() == Phase::Accepted
             },
@@ -235,7 +284,7 @@ where
 
 impl<T> Commander for Node<T>
 where
-    T: RoundTransport<PaxosRound, Command>,
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
     T::Node: Clone,
     T::Error: std::fmt::Debug,
 {
@@ -249,7 +298,12 @@ where
             }
             ProposerState::Follower => {
                 let leader_node = self.proposer.highest_observed_ballot().unwrap().1;
-                self.send(leader_node, Command::Proposal(val));
+                if leader_node == self.config.current() {
+                    self.proposer.push_proposal(val);
+                    self.propose_leadership();
+                } else {
+                    self.send(leader_node, Command::Proposal(val));
+                }
             }
             ProposerState::Candidate { .. } => {
                 // still waiting for promises, queue up the value
@@ -277,27 +331,42 @@ where
         self.proposer.observe_ballot(bal);
 
         let node_id = self.config.current();
+        let mut accepted = Vec::new();
+        let mut promise_slots = self.window.open_range().collect::<Vec<_>>();
+        if !promise_slots.contains(&slot) {
+            promise_slots.push(slot);
+        }
+        promise_slots.sort_unstable();
 
-        let response = match self.window.slot_mut(slot) {
-            SlotMutRef::Open(ref mut open_ref) => open_ref.acceptor().receive_prepare(bal),
-            SlotMutRef::Empty(empty_slot) => empty_slot.fill().acceptor().receive_prepare(bal),
-            SlotMutRef::Resolved(accepted_ballot, val) => {
-                PrepareResponse::Promise { proposed: bal, value: Some((accepted_ballot, val)) }
+        for open_slot in promise_slots {
+            let mut rejected = None;
+            match self.window.slot_mut(open_slot) {
+                SlotMutRef::Open(ref mut open_ref) => {
+                    match open_ref.acceptor().receive_prepare(bal) {
+                        PrepareResponse::Promise {
+                            value: Some((accepted_ballot, value)),
+                            ..
+                        } => {
+                            accepted.push((open_slot, accepted_ballot, value));
+                        }
+                        PrepareResponse::Reject { proposed, preempted } => {
+                            rejected = Some((proposed, preempted));
+                        }
+                        PrepareResponse::Promise { value: None, .. }
+                        | PrepareResponse::Resolved => {}
+                    }
+                }
+                SlotMutRef::Resolved(accepted_ballot, value) => {
+                    accepted.push((open_slot, accepted_ballot, value));
+                }
+                SlotMutRef::Empty(_) => {
+                    warn!("Empty slot {} detected in the middle of the open range", open_slot);
+                }
+                SlotMutRef::ResolutionTruncated => {
+                    unreachable!("Cannot be resolved in the middle of the open range")
+                }
             }
-            SlotMutRef::ResolutionTruncated => PrepareResponse::Resolved,
-        };
-
-        match response {
-            PrepareResponse::Promise { value, .. } => {
-                self.send_at(
-                    bal.1,
-                    slot,
-                    bal,
-                    Phase::Promise,
-                    Command::Promise { from: node_id, slot, ballot: bal, accepted: value },
-                );
-            }
-            PrepareResponse::Reject { proposed, preempted } => {
+            if let Some((proposed, preempted)) = rejected {
                 self.send_at(
                     bal.1,
                     slot,
@@ -311,17 +380,25 @@ where
                         phase: Phase::Prepare,
                     },
                 );
+                return;
             }
-            PrepareResponse::Resolved => {}
         }
+
+        self.send_at(
+            bal.1,
+            slot,
+            bal,
+            Phase::Promise,
+            Command::Promise { from: node_id, slot, ballot: bal, accepted },
+        );
     }
 
     fn promise(
         &mut self,
         node: NodeId,
-        slot: Slot,
+        _slot: Slot,
         bal: Ballot,
-        accepted: Option<(Ballot, Bytes)>,
+        accepted: Vec<(Slot, Ballot, Bytes)>,
     ) {
         if !self.proposer.state().is_candidate() {
             return;
@@ -330,8 +407,8 @@ where
         self.proposer.receive_promise(node, bal);
 
         // track highest proposals
-        if let Some((accepted_ballot, val)) = accepted {
-            match self.window.slot_mut(slot) {
+        for (accepted_slot, accepted_ballot, val) in accepted {
+            match self.window.slot_mut(accepted_slot) {
                 SlotMutRef::Open(ref mut open_slot) => {
                     open_slot.acceptor().notice_value(accepted_ballot, val);
                 }
@@ -347,7 +424,7 @@ where
     }
 
     fn accept(&mut self, slot: Slot, bal: Ballot, val: Bytes) {
-        self.proposer.observe_ballot(bal);
+        self.observe_ballot_and_forward(bal);
 
         let current_node = self.config.current();
         let acceptor_res = match self.window.slot_mut(slot) {
@@ -428,7 +505,7 @@ where
     }
 
     fn resolution(&mut self, slot: Slot, bal: Ballot, val: Bytes) {
-        self.proposer.observe_ballot(bal);
+        self.observe_ballot_and_forward(bal);
 
         match self.window.slot_mut(slot) {
             SlotMutRef::Empty(empty_slot) => empty_slot.fill().acceptor().resolve(bal, val),
@@ -454,13 +531,7 @@ where
             let leader = self.proposer.highest_observed_ballot().unwrap().1;
             let node = self.config.current();
             for slot in slots {
-                self.send_at(
-                    leader,
-                    slot,
-                    bal,
-                    Phase::Catchup,
-                    Command::Catchup { from: node, slot },
-                );
+                self.send_catchup_at(leader, slot, bal, Command::Catchup { from: node, slot });
             }
         }
     }
@@ -490,7 +561,7 @@ where
 
 impl<T> Replica for Node<T>
 where
-    T: RoundTransport<PaxosRound, Command>,
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
     T::Node: Clone,
     T::Error: std::fmt::Debug,
 {
@@ -536,7 +607,11 @@ where
     }
 
     fn tick(&mut self) {
-        let _ = self.comm.rounds().tick();
+        let current = self.config.current();
+        for slot in self.window.open_range().collect::<Vec<_>>() {
+            let _ = self.comm.on(PaxosKey::Slot { slot, proposer: current }).rounds().tick();
+            let _ = self.comm.on(PaxosKey::Catchup { slot, leader: current }).rounds().tick();
+        }
     }
 
     fn decisions(&self) -> DecisionSet {
@@ -548,7 +623,7 @@ where
 mod comm_tests {
     use super::*;
     use std::{convert::Infallible, ops::Index};
-    use traceforge_rounds::Envelope;
+    use traceforge_rounds::set::SetEnvelope;
 
     fn config() -> Configuration<NodeId> {
         Configuration::new(4u32, vec![(0, 0), (1, 1), (2, 2), (3, 3)].into_iter())
@@ -574,26 +649,27 @@ mod comm_tests {
         }
     }
 
-    impl RoundTransport<PaxosRound, Command> for VecTransport {
+    impl SetTransport<PaxosKey, PaxosRound, Command> for VecTransport {
         type Node = NodeId;
         type Error = Infallible;
 
         fn send(
             &mut self,
             dst: Self::Node,
-            envelope: Envelope<PaxosRound, Command>,
+            envelope: SetEnvelope<PaxosKey, PaxosRound, Command>,
         ) -> Result<(), Self::Error> {
             assert!(dst < 4);
-            let (_, msg) = envelope.into_parts();
+            let (_, _, msg) = envelope.into_parts();
             self.0[dst as usize].push(msg);
             Ok(())
         }
 
         fn recv<F>(
             &mut self,
+            _key: &PaxosKey,
             _current: &PaxosRound,
             _filter: F,
-        ) -> Result<Option<Envelope<PaxosRound, Command>>, Self::Error>
+        ) -> Result<Option<SetEnvelope<PaxosKey, PaxosRound, Command>>, Self::Error>
         where
             F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
         {
@@ -602,9 +678,10 @@ mod comm_tests {
 
         fn recv_block<F>(
             &mut self,
+            _key: &PaxosKey,
             _current: &PaxosRound,
             _filter: F,
-        ) -> Result<Envelope<PaxosRound, Command>, Self::Error>
+        ) -> Result<SetEnvelope<PaxosKey, PaxosRound, Command>, Self::Error>
         where
             F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
         {
@@ -613,11 +690,12 @@ mod comm_tests {
 
         fn inbox<F>(
             &mut self,
+            _key: &PaxosKey,
             _current: &PaxosRound,
             _filter: F,
             _min: usize,
             _max: Option<usize>,
-        ) -> Result<Vec<Option<Envelope<PaxosRound, Command>>>, Self::Error>
+        ) -> Result<Vec<Option<SetEnvelope<PaxosKey, PaxosRound, Command>>>, Self::Error>
         where
             F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
         {
@@ -635,7 +713,10 @@ mod comm_tests {
         for node in 0..4 {
             assert_eq!(&[expected.clone()], &replica.comm.transport()[node]);
         }
-        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Prepare));
+        assert_eq!(
+            replica.comm.on(PaxosKey::Slot { slot: 0, proposer: 4 }).rounds().current(),
+            &PaxosRound::new(0, Phase::Prepare)
+        );
     }
 
     #[test]
@@ -644,25 +725,28 @@ mod comm_tests {
         replica.proposal("123".into());
         replica.comm.transport_mut().clear();
 
-        replica.promise(0, 0, Ballot(0, 4), None);
+        replica.promise(0, 0, Ballot(0, 4), Vec::new());
         for node in 0..4 {
             assert!(replica.comm.transport()[node].is_empty());
         }
 
-        replica.promise(2, 0, Ballot(0, 4), None);
+        replica.promise(2, 0, Ballot(0, 4), Vec::new());
         let expected = Command::Accept { slot: 0, ballot: Ballot(0, 4), value: "123".into() };
         for node in 0..4 {
             assert_eq!(&[expected.clone()], &replica.comm.transport()[node]);
         }
-        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Accept));
+        assert_eq!(
+            replica.comm.on(PaxosKey::Slot { slot: 0, proposer: 4 }).rounds().current(),
+            &PaxosRound::new(0, Phase::Accept)
+        );
     }
 
     #[test]
     fn accepted_quorum_broadcasts_resolution() {
         let mut replica = Node::new(VecTransport::default(), config());
         replica.proposal("123".into());
-        replica.promise(1, 0, Ballot(0, 4), None);
-        replica.promise(2, 0, Ballot(0, 4), None);
+        replica.promise(1, 0, Ballot(0, 4), Vec::new());
+        replica.promise(2, 0, Ballot(0, 4), Vec::new());
         replica.comm.transport_mut().clear();
 
         replica.accepted(0, 0, Ballot(0, 4));
@@ -697,11 +781,15 @@ mod comm_tests {
         let mut replica = Node::new(VecTransport::default(), config());
 
         replica.receive_stamped(
-            PaxosRound::new(7, 3, Phase::Resolution),
+            PaxosKey::ProposalTo(4),
+            PaxosRound::new(3, Phase::Resolution),
             Command::Proposal("123".into()),
         );
 
-        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Prepare));
+        assert_eq!(
+            replica.comm.on(PaxosKey::Slot { slot: 0, proposer: 4 }).rounds().current(),
+            &PaxosRound::new(0, Phase::Prepare)
+        );
     }
 
     #[test]
@@ -709,10 +797,14 @@ mod comm_tests {
         let mut replica = Node::new(VecTransport::default(), config());
 
         replica.receive_stamped(
-            PaxosRound::new(7, 3, Phase::Catchup),
+            PaxosKey::Catchup { slot: 7, leader: 4 },
+            PaxosRound::new(3, Phase::Catchup),
             Command::Catchup { from: 1, slot: 7 },
         );
 
-        assert_eq!(replica.comm.rounds().current(), &PaxosRound::new(0, 0, Phase::Prepare));
+        assert_eq!(
+            replica.comm.on(PaxosKey::Slot { slot: 0, proposer: 4 }).rounds().current(),
+            &PaxosRound::new(0, Phase::Prepare)
+        );
     }
 }

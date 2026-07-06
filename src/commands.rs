@@ -1,4 +1,4 @@
-use crate::round::PaxosRound;
+use crate::round::{PaxosKey, PaxosRound};
 use crate::{Ballot, NodeId, Slot, round::Phase};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -19,10 +19,10 @@ pub trait Commander {
     /// Receive a Phase 1a PREPARE message containing the proposed ballot
     fn prepare(&mut self, slot: Slot, bal: Ballot);
 
-    /// Receive a Phase 1b PROMISE message containing the node
-    /// that generated the promise, the ballot promised and the accepted
-    /// value for this slot, if one exists.
-    fn promise(&mut self, node: NodeId, slot: Slot, bal: Ballot, accepted: Option<(Ballot, Bytes)>);
+    /// Receive a Phase 1b PROMISE message containing the node that generated
+    /// the promise, the ballot promised and the accepted values known across
+    /// the receiver's open window.
+    fn promise(&mut self, node: NodeId, slot: Slot, bal: Ballot, accepted: Vec<(Slot, Ballot, Bytes)>);
 
     /// Receive a Phase 2a ACCEPT message that contains the the slot, proposed
     /// ballot and value of the proposal. The ballot contains the node of
@@ -97,10 +97,10 @@ pub enum Command {
     /// Phase 1a PREPARE message containing the proposed ballot
     Prepare { slot: Slot, ballot: Ballot },
 
-    /// Phase 1b PROMISE message containing the node
-    /// that generated the promise, the ballot promised and the slot's
-    /// previously accepted value, if one exists.
-    Promise { from: NodeId, slot: Slot, ballot: Ballot, accepted: Option<(Ballot, Bytes)> },
+    /// Phase 1b PROMISE message containing the node that generated the promise,
+    /// the ballot promised and accepted values known across the receiver's open
+    /// window. `slot` is the comm-close context for the phase-1 exchange.
+    Promise { from: NodeId, slot: Slot, ballot: Ballot, accepted: Vec<(Slot, Ballot, Bytes)> },
 
     /// Phase 2a ACCEPT message that contains the the slot, proposed
     /// ballot and value of the proposal. The ballot contains the node of
@@ -129,31 +129,66 @@ pub enum Command {
 }
 
 impl Command {
+    pub fn key_for(&self, receiver: NodeId) -> PaxosKey {
+        match self {
+            Command::Proposal(_) => PaxosKey::ProposalTo(receiver),
+            Command::Prepare { slot, ballot }
+            | Command::Promise { slot, ballot, .. }
+            | Command::Accept { slot, ballot, .. }
+            | Command::Accepted { slot, ballot, .. }
+            | Command::Resolution { slot, ballot, .. } => {
+                PaxosKey::Slot { slot: *slot, proposer: ballot.1 }
+            }
+            Command::Reject { slot, proposed, .. } => {
+                PaxosKey::Slot { slot: *slot, proposer: proposed.1 }
+            }
+            Command::Catchup { slot, .. } => PaxosKey::Catchup { slot: *slot, leader: receiver },
+        }
+    }
+
     /// Returns the Paxos round that is part of the command's protocol payload.
     ///
     /// Proposal and catchup messages are intentionally excluded: proposals are
     /// client work forwarded between replicas, and catchup requests do not carry
     /// a ballot in the original protocol.
-    pub fn protocol_round(&self) -> Option<PaxosRound> {
+    pub fn protocol_stamp(&self) -> Option<(PaxosKey, PaxosRound)> {
         match self {
             Command::Proposal(_) | Command::Catchup { .. } => None,
             Command::Prepare { slot, ballot } => {
-                Some(PaxosRound::new(*slot, ballot.0, Phase::Prepare))
+                Some((
+                    PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
+                    PaxosRound::new(ballot.0, Phase::Prepare),
+                ))
             }
             Command::Promise { slot, ballot, .. } => {
-                Some(PaxosRound::new(*slot, ballot.0, Phase::Promise))
+                Some((
+                    PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
+                    PaxosRound::new(ballot.0, Phase::Promise),
+                ))
             }
             Command::Accept { slot, ballot, .. } => {
-                Some(PaxosRound::new(*slot, ballot.0, Phase::Accept))
+                Some((
+                    PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
+                    PaxosRound::new(ballot.0, Phase::Accept),
+                ))
             }
             Command::Reject { slot, proposed, .. } => {
-                Some(PaxosRound::new(*slot, proposed.0, Phase::Reject))
+                Some((
+                    PaxosKey::Slot { slot: *slot, proposer: proposed.1 },
+                    PaxosRound::new(proposed.0, Phase::Reject),
+                ))
             }
             Command::Accepted { slot, ballot, .. } => {
-                Some(PaxosRound::new(*slot, ballot.0, Phase::Accepted))
+                Some((
+                    PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
+                    PaxosRound::new(ballot.0, Phase::Accepted),
+                ))
             }
             Command::Resolution { slot, ballot, .. } => {
-                Some(PaxosRound::new(*slot, ballot.0, Phase::Resolution))
+                Some((
+                    PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
+                    PaxosRound::new(ballot.0, Phase::Resolution),
+                ))
             }
         }
     }

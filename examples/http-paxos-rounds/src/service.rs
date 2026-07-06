@@ -11,6 +11,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, task::JoinHandle, time::interval};
 
 type PaxosNode = Node<HttpTransport>;
+const DRAIN_MAX_STEPS: usize = 8;
+const DRAIN_MAX_MESSAGES_PER_STEP: usize = 64;
 
 #[derive(Clone)]
 pub struct Handler {
@@ -43,6 +45,8 @@ impl Handler {
             }
         });
 
+        // Fallback only: normal protocol progress is driven immediately from
+        // the HTTP handlers so request latency is not quantized by this timer.
         let replica = self.replica.clone();
         let cursor = self.cursor.clone();
         let kv = self.kv.clone();
@@ -53,12 +57,32 @@ impl Handler {
                 let mut node = replica.lock().await;
                 let mut cursor = cursor.lock().await;
                 let mut state = kv.state();
-                let _ = driver::drain_once(&mut node, &mut state, &mut cursor, 32);
+                let _ = driver::drain_until_idle(
+                    &mut node,
+                    &mut state,
+                    &mut cursor,
+                    DRAIN_MAX_STEPS,
+                    DRAIN_MAX_MESSAGES_PER_STEP,
+                );
                 kv.notify_new_events();
             }
         });
 
         vec![cleanup, drain]
+    }
+
+    async fn drain_pending(&self) {
+        let mut node = self.replica.lock().await;
+        let mut cursor = self.cursor.lock().await;
+        let mut state = self.kv.state();
+        let _ = driver::drain_until_idle(
+            &mut node,
+            &mut state,
+            &mut cursor,
+            DRAIN_MAX_STEPS,
+            DRAIN_MAX_MESSAGES_PER_STEP,
+        );
+        self.kv.notify_new_events();
     }
 
     pub async fn handle(&self, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
@@ -67,6 +91,7 @@ impl Handler {
             (&Method::POST, key) if key == "paxos" => {
                 let bytes = hyper::body::to_bytes(req.into_body()).await?;
                 self.transport.push_bytes(bytes);
+                self.drain_pending().await;
                 respond(StatusCode::ACCEPTED)
             }
             (&Method::POST, key) => {
@@ -77,6 +102,7 @@ impl Handler {
                     .lock()
                     .await
                     .receive(Command::Proposal(KvCommand::Set { request_id, key, value }.into()));
+                self.drain_pending().await;
 
                 match receiver.await {
                     Ok(slot) => Ok(Response::builder()
@@ -94,6 +120,7 @@ impl Handler {
                     .lock()
                     .await
                     .receive(Command::Proposal(KvCommand::Get { request_id, key }.into()));
+                self.drain_pending().await;
 
                 match receiver.await {
                     Ok(Some((slot, value))) => Ok(Response::builder()

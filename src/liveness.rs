@@ -129,11 +129,16 @@ mod tests {
         assert_eq!(live.inner.commands[0], Command::Prepare { slot: 0, ballot: Ballot(2, 3) });
 
         let mut live = Liveness::new(Inner::default());
-        live.receive(Command::Promise { from: 0, slot: 0, ballot: Ballot(2, 3), accepted: None });
+        live.receive(Command::Promise {
+            from: 0,
+            slot: 0,
+            ballot: Ballot(2, 3),
+            accepted: Vec::new(),
+        });
         assert!(live.leader_election.latest_message.is_some());
         assert_eq!(
             live.inner.commands[0],
-            Command::Promise { from: 0, slot: 0, ballot: Ballot(2, 3), accepted: None }
+            Command::Promise { from: 0, slot: 0, ballot: Ballot(2, 3), accepted: Vec::new() }
         );
 
         let mut live = Liveness::new(Inner::default());

@@ -43,7 +43,7 @@ use std::cmp;
 pub use commands::{Command, Receiver};
 pub use config::{Configuration, NodeMetadata};
 pub use node::Node;
-pub use round::{PaxosRound, Phase};
+pub use round::{PaxosKey, PaxosRound, Phase};
 use serde::{Deserialize, Serialize};
 pub use statemachine::ReplicatedState;
 use std::marker::Sized;
