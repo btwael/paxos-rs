@@ -3,7 +3,7 @@ use bytes::Bytes;
 use hyper::{Body, Method, Request, Response, StatusCode};
 use paxos::{Command, Configuration, Node, Receiver};
 use paxos_example_support::{
-    driver::{self, DecisionCursor},
+    driver::DecisionCursor,
     kvstore::{KvCommand, KvState},
 };
 use rand::random;
@@ -11,13 +11,10 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, task::JoinHandle, time::interval};
 
 type PaxosNode = Node<HttpTransport>;
-const DRAIN_MAX_STEPS: usize = 8;
-const DRAIN_MAX_MESSAGES_PER_STEP: usize = 64;
 
 #[derive(Clone)]
 pub struct Handler {
     replica: Arc<Mutex<PaxosNode>>,
-    transport: HttpTransport,
     kv: HttpKv,
     cursor: Arc<Mutex<DecisionCursor>>,
 }
@@ -29,7 +26,6 @@ impl Handler {
         let replica = Node::new(transport.clone(), config);
         Handler {
             replica: Arc::new(Mutex::new(replica)),
-            transport,
             kv: HttpKv::new(kv_state),
             cursor: Arc::new(Mutex::new(DecisionCursor::new())),
         }
@@ -45,43 +41,13 @@ impl Handler {
             }
         });
 
-        // Fallback only: normal protocol progress is driven immediately from
-        // the HTTP handlers so request latency is not quantized by this timer.
-        let replica = self.replica.clone();
-        let cursor = self.cursor.clone();
-        let kv = self.kv.clone();
-        let drain = tokio::spawn(async move {
-            let mut ticks = interval(Duration::from_millis(10));
-            loop {
-                ticks.tick().await;
-                let mut node = replica.lock().await;
-                let mut cursor = cursor.lock().await;
-                let mut state = kv.state();
-                let _ = driver::drain_until_idle(
-                    &mut node,
-                    &mut state,
-                    &mut cursor,
-                    DRAIN_MAX_STEPS,
-                    DRAIN_MAX_MESSAGES_PER_STEP,
-                );
-                kv.notify_new_events();
-            }
-        });
-
-        vec![cleanup, drain]
+        vec![cleanup]
     }
 
-    async fn drain_pending(&self) {
-        let mut node = self.replica.lock().await;
+    async fn apply_decisions(&self, node: &PaxosNode) {
         let mut cursor = self.cursor.lock().await;
         let mut state = self.kv.state();
-        let _ = driver::drain_until_idle(
-            &mut node,
-            &mut state,
-            &mut cursor,
-            DRAIN_MAX_STEPS,
-            DRAIN_MAX_MESSAGES_PER_STEP,
-        );
+        cursor.apply(node, &mut state);
         self.kv.notify_new_events();
     }
 
@@ -90,19 +56,24 @@ impl Handler {
         match (req.method(), path) {
             (&Method::POST, key) if key == "paxos" => {
                 let bytes = hyper::body::to_bytes(req.into_body()).await?;
-                self.transport.push_bytes(bytes);
-                self.drain_pending().await;
+                let mut node = self.replica.lock().await;
+                for wire in HttpTransport::decode_bytes(bytes) {
+                    node.try_receive_stamped(wire.key, wire.round, wire.command);
+                }
+                self.apply_decisions(&node).await;
                 respond(StatusCode::ACCEPTED)
             }
             (&Method::POST, key) => {
                 let value = hyper::body::to_bytes(req.into_body()).await?;
                 let request_id = random();
                 let receiver = self.kv.register_set(request_id);
-                self.replica
-                    .lock()
-                    .await
-                    .receive(Command::Proposal(KvCommand::Set { request_id, key, value }.into()));
-                self.drain_pending().await;
+                {
+                    let mut node = self.replica.lock().await;
+                    node.receive(Command::Proposal(
+                        KvCommand::Set { request_id, key, value }.into(),
+                    ));
+                    self.apply_decisions(&node).await;
+                }
 
                 match receiver.await {
                     Ok(slot) => Ok(Response::builder()
@@ -116,11 +87,11 @@ impl Handler {
             (&Method::GET, key) => {
                 let request_id = random::<u64>();
                 let receiver = self.kv.register_get(request_id);
-                self.replica
-                    .lock()
-                    .await
-                    .receive(Command::Proposal(KvCommand::Get { request_id, key }.into()));
-                self.drain_pending().await;
+                {
+                    let mut node = self.replica.lock().await;
+                    node.receive(Command::Proposal(KvCommand::Get { request_id, key }.into()));
+                    self.apply_decisions(&node).await;
+                }
 
                 match receiver.await {
                     Ok(Some((slot, value))) => Ok(Response::builder()

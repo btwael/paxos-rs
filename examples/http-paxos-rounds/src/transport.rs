@@ -29,11 +29,18 @@ impl Default for HttpTransport {
 }
 
 impl HttpTransport {
+    pub fn decode_bytes(bytes: Bytes) -> Vec<WireEnvelope> {
+        bincode::deserialize::<WireEnvelope>(&bytes)
+            .map(|envelope| vec![envelope])
+            .unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
     pub fn push_bytes(&self, bytes: Bytes) {
-        let Ok(wire) = bincode::deserialize::<WireEnvelope>(&bytes) else {
-            return;
-        };
-        self.inbound.lock().unwrap().push_back(SetEnvelope::new(wire.key, wire.round, wire.command));
+        let mut inbound = self.inbound.lock().unwrap();
+        for wire in Self::decode_bytes(bytes) {
+            inbound.push_back(SetEnvelope::new(wire.key, wire.round, wire.command));
+        }
     }
 
     fn pop_matching<F>(
@@ -49,6 +56,15 @@ impl HttpTransport {
         let index = inbound
             .iter()
             .position(|envelope| envelope.key() == key && filter(current, envelope.stamp()))?;
+        inbound.remove(index)
+    }
+
+    fn pop_keyed<F>(&mut self, filter: &F) -> Option<SetEnvelope<PaxosKey, PaxosRound, Command>>
+    where
+        F: Fn(&PaxosKey, &PaxosRound) -> bool,
+    {
+        let mut inbound = self.inbound.lock().unwrap();
+        let index = inbound.iter().position(|envelope| filter(envelope.key(), envelope.stamp()))?;
         inbound.remove(index)
     }
 }
@@ -98,6 +114,16 @@ impl SetTransport<PaxosKey, PaxosRound, Command> for HttpTransport {
             }
             std::thread::yield_now();
         }
+    }
+
+    fn recv_keyed<F>(
+        &mut self,
+        filter: F,
+    ) -> Result<Option<SetEnvelope<PaxosKey, PaxosRound, Command>>, Self::Error>
+    where
+        F: Fn(&PaxosKey, &PaxosRound) -> bool + Send + Sync + 'static,
+    {
+        Ok(self.pop_keyed(&filter))
     }
 
     fn inbox<F>(

@@ -217,6 +217,25 @@ where
         self.receive(cmd);
     }
 
+    pub fn try_receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool {
+        if key != cmd.key_for(self.config.current()) {
+            return false;
+        }
+
+        if let Some((protocol_key, protocol_round)) = cmd.protocol_stamp() {
+            if key != protocol_key || round != protocol_round {
+                return false;
+            }
+
+            if self.comm.on(key).rounds().jump(round).is_err() {
+                return false;
+            }
+        }
+
+        self.receive(cmd);
+        true
+    }
+
     pub fn collect_promise_inbox(
         &mut self,
         slot: Slot,
@@ -344,8 +363,7 @@ where
                 SlotMutRef::Open(ref mut open_ref) => {
                     match open_ref.acceptor().receive_prepare(bal) {
                         PrepareResponse::Promise {
-                            value: Some((accepted_ballot, value)),
-                            ..
+                            value: Some((accepted_ballot, value)), ..
                         } => {
                             accepted.push((open_slot, accepted_ballot, value));
                         }
@@ -686,6 +704,16 @@ mod comm_tests {
             F: Fn(&PaxosRound, &PaxosRound) -> bool + Send + Sync + 'static,
         {
             unreachable!("VecTransport has no blocking receive queue")
+        }
+
+        fn recv_keyed<F>(
+            &mut self,
+            _filter: F,
+        ) -> Result<Option<SetEnvelope<PaxosKey, PaxosRound, Command>>, Self::Error>
+        where
+            F: Fn(&PaxosKey, &PaxosRound) -> bool + Send + Sync + 'static,
+        {
+            Ok(None)
         }
 
         fn inbox<F>(

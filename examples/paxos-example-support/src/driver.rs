@@ -2,6 +2,7 @@ use bytes::Bytes;
 use paxos::{
     Command, Node, NodeId, PaxosKey, PaxosRound, Phase, Receiver, Replica, ReplicatedState, Slot,
 };
+use std::collections::BTreeSet;
 use traceforge_rounds::set::{SetCommError, SetTransport};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -97,8 +98,13 @@ where
     let current = node.current_node_id();
 
     merge(&mut total, receive_proposal(node, state, cursor)?);
-    for slot in bounded_slots(max_slots) {
-        for proposer in bounded_nodes(nodes) {
+    merge(&mut total, receive_future_slot_opener(node, state, cursor, Some(max_slots))?);
+    for _ in bounded_nodes(nodes) {
+        merge(&mut total, receive_proposal(node, state, cursor)?);
+    }
+
+    for proposer in bounded_nodes(nodes) {
+        for slot in bounded_known_slots(node, max_slots) {
             merge(
                 &mut total,
                 receive_slot_phase(node, state, cursor, slot, proposer, Phase::Prepare)?,
@@ -142,12 +148,14 @@ where
                 receive_slot_phase(node, state, cursor, slot, proposer, Phase::Reject)?,
             );
             merge(&mut total, receive_proposal(node, state, cursor)?);
+            merge(&mut total, receive_future_slot_opener(node, state, cursor, Some(max_slots))?);
         }
-        merge(
-            &mut total,
-            receive_slot_phase(node, state, cursor, slot, current, Phase::Catchup)?,
-        );
+    }
+
+    for slot in bounded_known_slots(node, max_slots) {
+        merge(&mut total, receive_slot_phase(node, state, cursor, slot, current, Phase::Catchup)?);
         merge(&mut total, receive_proposal(node, state, cursor)?);
+        merge(&mut total, receive_future_slot_opener(node, state, cursor, Some(max_slots))?);
     }
 
     Ok(total)
@@ -167,6 +175,30 @@ where
 {
     let key = PaxosKey::ProposalTo(node.current_node_id());
     receive_key(node, state, cursor, key, |_| true)
+}
+
+fn receive_future_slot_opener<T, S>(
+    node: &mut Node<T>,
+    state: &mut S,
+    cursor: &mut DecisionCursor,
+    max_slots: Option<usize>,
+) -> Result<StepStats, SetCommError<PaxosKey, PaxosRound, Command, T::Error>>
+where
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+    Command: 'static,
+    S: ReplicatedState,
+{
+    let mut stats = StepStats::default();
+    let Some((key, round, command)) = receive_any_future_slot_opener(node, max_slots)? else {
+        return Ok(stats);
+    };
+
+    node.receive_stamped(key, round, command);
+    stats.received += 1;
+    stats.applied += cursor.apply(node, state);
+    Ok(stats)
 }
 
 fn receive_slot_phase<T, S>(
@@ -257,12 +289,18 @@ where
     Ok(StepStats { received, applied: cursor.apply(node, state) })
 }
 
-fn bounded_slots(max_slots: usize) -> impl Iterator<Item = Slot> {
-    0..max_slots as Slot
-}
-
 fn bounded_nodes(nodes: usize) -> impl Iterator<Item = NodeId> {
     (0..nodes).map(|node| node as NodeId)
+}
+
+fn bounded_known_slots<T>(node: &Node<T>, max_slots: usize) -> impl Iterator<Item = Slot>
+where
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+{
+    let max_slots = max_slots as Slot;
+    node.open_slots().into_iter().filter(move |slot| *slot < max_slots)
 }
 
 fn receive_any_known_key<T>(
@@ -278,19 +316,53 @@ where
     if let Some((round, command)) = node.comm_mut().on(proposal_key).recv_stamped::<Command>()? {
         return Ok(Some((proposal_key, round, command)));
     }
-    for slot in node.open_slots() {
-        for proposer in node.participant_node_ids() {
+    for proposer in node.participant_node_ids() {
+        for slot in node.open_slots() {
             let key = PaxosKey::Slot { slot, proposer };
             if let Some((round, command)) = node.comm_mut().on(key).recv_stamped::<Command>()? {
                 return Ok(Some((key, round, command)));
             }
         }
+    }
+    for slot in node.open_slots() {
         let key = PaxosKey::Catchup { slot, leader: node.current_node_id() };
         if let Some((round, command)) = node.comm_mut().on(key).recv_stamped::<Command>()? {
             return Ok(Some((key, round, command)));
         }
     }
+    if let Some(received) = receive_any_future_slot_opener(node, None)? {
+        return Ok(Some(received));
+    }
     Ok(None)
+}
+
+fn receive_any_future_slot_opener<T>(
+    node: &mut Node<T>,
+    max_slots: Option<usize>,
+) -> Result<Option<(PaxosKey, PaxosRound, Command)>, SetCommError<PaxosKey, PaxosRound, Command, T::Error>>
+where
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+    Command: 'static,
+{
+    let known_slots = node.open_slots().into_iter().collect::<BTreeSet<_>>();
+    let participants = node.participant_node_ids().into_iter().collect::<BTreeSet<_>>();
+    let max_slot = max_slots.map(|slots| slots as Slot);
+    node.comm_mut().recv_stamped_keyed_with::<Command, _>(move |key, _local, remote| {
+        let PaxosKey::Slot { slot, proposer } = key else {
+            return false;
+        };
+        if known_slots.contains(slot) || !participants.contains(proposer) {
+            return false;
+        }
+        if let Some(max_slot) = max_slot {
+            if *slot >= max_slot {
+                return false;
+            }
+        }
+        matches!(remote.phase(), Phase::Accept | Phase::Resolution)
+    })
 }
 
 fn merge(total: &mut StepStats, step: StepStats) {
