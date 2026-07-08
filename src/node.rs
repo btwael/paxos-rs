@@ -1,5 +1,5 @@
 use crate::{
-    Ballot, Configuration, NodeId, Replica, Slot,
+    Ballot, Configuration, NodeId, Replica, Slot, StampedReceiver,
     acceptor::{AcceptResponse, PrepareResponse},
     commands::*,
     proposer::{Proposer, ProposerState},
@@ -61,6 +61,15 @@ where
 
     pub fn open_slots(&self) -> Vec<Slot> {
         self.window.open_range().collect()
+    }
+
+    fn unresolved_open_slots(&mut self) -> Vec<Slot> {
+        self.window
+            .open_range()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|slot| matches!(self.window.slot_mut(*slot), SlotMutRef::Open(_)))
+            .collect()
     }
 
     pub fn participant_node_ids(&self) -> Vec<NodeId> {
@@ -217,7 +226,7 @@ where
         self.receive(cmd);
     }
 
-    pub fn try_receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool {
+    fn receive_stamped_checked(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool {
         if key != cmd.key_for(self.config.current()) {
             return false;
         }
@@ -298,6 +307,17 @@ where
             }
         }
         Ok(count)
+    }
+}
+
+impl<T> StampedReceiver for Node<T>
+where
+    T: SetTransport<PaxosKey, PaxosRound, Command>,
+    T::Node: Clone,
+    T::Error: std::fmt::Debug,
+{
+    fn try_receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool {
+        self.receive_stamped_checked(key, round, cmd)
     }
 }
 
@@ -586,7 +606,7 @@ where
     fn propose_leadership(&mut self) {
         match *self.proposer.state() {
             ProposerState::Candidate { proposal, .. } => {
-                for slot in self.window.open_range().collect::<Vec<_>>() {
+                for slot in self.unresolved_open_slots() {
                     self.broadcast_at(
                         slot,
                         proposal,
@@ -597,7 +617,7 @@ where
             }
             ProposerState::Follower => {
                 let bal = self.proposer.prepare();
-                for slot in self.window.open_range().collect::<Vec<_>>() {
+                for slot in self.unresolved_open_slots() {
                     self.broadcast_at(
                         slot,
                         bal,
@@ -608,7 +628,7 @@ where
             }
             ProposerState::Leader { proposal } => {
                 // TODO: do we want a special sync here? What about periodic bumping ballot?
-                for slot in self.window.open_range().collect::<Vec<_>>() {
+                for slot in self.unresolved_open_slots() {
                     self.broadcast_at(
                         slot,
                         proposal,
@@ -833,6 +853,60 @@ mod comm_tests {
         assert_eq!(
             replica.comm.on(PaxosKey::Slot { slot: 0, proposer: 4 }).rounds().current(),
             &PaxosRound::new(0, Phase::Prepare)
+        );
+    }
+
+    #[test]
+    fn liveness_retry_skips_already_resolved_slots() {
+        let mut replica = Node::new(VecTransport::default(), config());
+
+        replica.proposal("first".into());
+        replica.promise(1, 0, Ballot(0, 4), Vec::new());
+        replica.promise(2, 0, Ballot(0, 4), Vec::new());
+
+        replica.receive_stamped(
+            PaxosKey::Slot { slot: 1, proposer: 4 },
+            PaxosRound::new(0, Phase::Resolution),
+            Command::Resolution { slot: 1, ballot: Ballot(0, 4), value: "second".into() },
+        );
+        replica.comm.transport_mut().clear();
+
+        replica.propose_leadership();
+
+        let expected = Command::Accept { slot: 0, ballot: Ballot(0, 4), value: Bytes::default() };
+        for node in 0..4 {
+            assert_eq!(&[expected.clone()], &replica.comm.transport()[node]);
+        }
+        assert_eq!(
+            replica.comm.on(PaxosKey::Slot { slot: 1, proposer: 4 }).rounds().current(),
+            &PaxosRound::new(0, Phase::Resolution)
+        );
+    }
+
+    #[test]
+    fn resolution_can_follow_reject_for_same_ballot() {
+        let mut replica = Node::new(VecTransport::default(), config());
+
+        replica.receive_stamped(
+            PaxosKey::Slot { slot: 0, proposer: 4 },
+            PaxosRound::new(0, Phase::Reject),
+            Command::Reject {
+                from: 1,
+                slot: 0,
+                proposed: Ballot(0, 4),
+                preempted: Ballot(1, 2),
+                phase: Phase::Accept,
+            },
+        );
+        replica.receive_stamped(
+            PaxosKey::Slot { slot: 0, proposer: 4 },
+            PaxosRound::new(0, Phase::Resolution),
+            Command::Resolution { slot: 0, ballot: Ballot(0, 4), value: "chosen".into() },
+        );
+
+        assert_eq!(
+            vec![(0, "chosen".into())],
+            replica.window.decisions().iter().collect::<Vec<_>>()
         );
     }
 }

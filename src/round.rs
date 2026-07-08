@@ -8,10 +8,10 @@ pub enum Phase {
     Prepare,
     Promise,
     Accept,
+    Reject,
     Accepted,
     Resolution,
     Catchup,
-    Reject,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

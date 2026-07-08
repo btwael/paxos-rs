@@ -25,11 +25,9 @@ impl DecisionCursor {
         self.next_slot
     }
 
-    pub fn apply<T, S>(&mut self, node: &Node<T>, state: &mut S) -> usize
+    pub fn apply<R, S>(&mut self, node: &R, state: &mut S) -> usize
     where
-        T: SetTransport<PaxosKey, PaxosRound, Command>,
-        T::Node: Clone,
-        T::Error: std::fmt::Debug,
+        R: Replica,
         S: ReplicatedState,
     {
         let mut applied = 0;

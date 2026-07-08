@@ -1,7 +1,7 @@
 use crate::{kv_http::HttpKv, transport::HttpTransport};
 use bytes::Bytes;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use paxos::{Command, Configuration, Node, Receiver};
+use paxos::{Command, Configuration, Node, Receiver, Replica, StampedReceiver, liveness::Liveness};
 use paxos_example_support::{
     driver::DecisionCursor,
     kvstore::{KvCommand, KvState},
@@ -10,7 +10,7 @@ use rand::random;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, task::JoinHandle, time::interval};
 
-type PaxosNode = Node<HttpTransport>;
+type PaxosNode = Liveness<Node<HttpTransport>>;
 
 #[derive(Clone)]
 pub struct Handler {
@@ -23,7 +23,7 @@ impl Handler {
     pub fn new(config: Configuration<String>) -> Handler {
         let transport = HttpTransport::default();
         let kv_state = KvState::default();
-        let replica = Node::new(transport.clone(), config);
+        let replica = Node::new(transport.clone(), config).liveness();
         Handler {
             replica: Arc::new(Mutex::new(replica)),
             kv: HttpKv::new(kv_state),
@@ -41,7 +41,16 @@ impl Handler {
             }
         });
 
-        vec![cleanup]
+        let replica_tick = self.replica.clone();
+        let liveness_tick = tokio::spawn(async move {
+            let mut ticks = interval(Duration::from_millis(100));
+            loop {
+                ticks.tick().await;
+                replica_tick.lock().await.tick_liveness();
+            }
+        });
+
+        vec![cleanup, liveness_tick]
     }
 
     async fn apply_decisions(&self, node: &PaxosNode) {

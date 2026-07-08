@@ -122,6 +122,10 @@ pub trait Replica: Receiver {
     }
 }
 
+pub trait StampedReceiver: Receiver {
+    fn try_receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

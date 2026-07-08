@@ -30,7 +30,7 @@ struct ModelOptions {
 
 impl Default for ModelOptions {
     fn default() -> Self {
-        Self { nodes: 3, requests: 2, max_slots: 2, max_ballots: 2, workers: 4, print_decisions: false }
+        Self { nodes: 3, requests: 1, max_slots: 1, max_ballots: 1, workers: 4, print_decisions: false }
     }
 }
 

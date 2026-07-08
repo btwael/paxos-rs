@@ -1,5 +1,5 @@
 use crate::{
-    Replica,
+    PaxosKey, PaxosRound, Replica, StampedReceiver,
     commands::{Command, Receiver},
     window::DecisionSet,
 };
@@ -20,22 +20,12 @@ impl<R: Replica> Liveness<R> {
             leader_election: Timeout::new(Duration::from_secs(2)),
         }
     }
-}
 
-impl<R: Replica> Receiver for Liveness<R> {
-    fn receive(&mut self, cmd: Command) {
-        // Bump leadership timeout if the command is not a catchup or proposal
-        match &cmd {
-            &Command::Proposal(_) | &Command::Catchup { .. } => {}
-            _ => self.leader_election.bump(),
-        }
-
-        self.inner.receive(cmd);
+    pub fn tick_liveness(&mut self) {
+        self.drive_timeout();
     }
-}
 
-impl<R: Replica> Replica for Liveness<R> {
-    fn tick(&mut self) {
+    fn drive_timeout(&mut self) {
         let lapsed = if self.inner.is_leader() {
             self.leader_election.near()
         } else {
@@ -47,7 +37,23 @@ impl<R: Replica> Replica for Liveness<R> {
             self.inner.propose_leadership();
             self.leader_election.clear();
         }
+    }
+}
 
+impl<R: Replica> Receiver for Liveness<R> {
+    fn receive(&mut self, cmd: Command) {
+        // Bump leadership timeout if the command is not a catchup or proposal
+        if bumps_leadership_timeout(&cmd) {
+            self.leader_election.bump();
+        }
+
+        self.inner.receive(cmd);
+    }
+}
+
+impl<R: Replica> Replica for Liveness<R> {
+    fn tick(&mut self) {
+        self.drive_timeout();
         self.inner.tick();
     }
 
@@ -62,6 +68,24 @@ impl<R: Replica> Replica for Liveness<R> {
     fn decisions(&self) -> DecisionSet {
         self.inner.decisions()
     }
+}
+
+impl<R> StampedReceiver for Liveness<R>
+where
+    R: Replica + StampedReceiver,
+{
+    fn try_receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool {
+        let bumps_timeout = bumps_leadership_timeout(&cmd);
+        let received = self.inner.try_receive_stamped(key, round, cmd);
+        if received && bumps_timeout {
+            self.leader_election.bump();
+        }
+        received
+    }
+}
+
+fn bumps_leadership_timeout(cmd: &Command) -> bool {
+    !matches!(cmd, Command::Proposal(_) | Command::Catchup { .. })
 }
 
 struct Timeout {

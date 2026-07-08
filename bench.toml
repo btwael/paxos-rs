@@ -1,0 +1,98 @@
+[settings]
+bin_dir = "examples/traceforge-paxos/target/release"
+binary = "traceforge-paxos"
+results_dir = "results/tf-kvstore"
+available_cores = 250
+jobs = 250
+timeout_hours = 51
+snapshot_interval_hours = 1
+default_workers = 250
+default_max_slots = 2
+default_max_ballots = 1
+default_print_decisions = false
+
+[[run]]
+nodes = 3
+requests = 1
+max_slots = 1
+max_ballots = 1
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 2
+max_slots = 1
+max_ballots = 1
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 3
+max_slots = 1
+max_ballots = 1
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 1
+max_slots = 2
+max_ballots = 1
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 2
+max_slots = 2
+max_ballots = 1
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 3
+max_slots = 2
+max_ballots = 1
+workers = 250
+
+#########
+
+[[run]]
+nodes = 3
+requests = 1
+max_slots = 1
+max_ballots = 2
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 2
+max_slots = 1
+max_ballots = 2
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 3
+max_slots = 1
+max_ballots = 2
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 1
+max_slots = 2
+max_ballots = 2
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 2
+max_slots = 2
+max_ballots = 2
+workers = 250
+
+[[run]]
+nodes = 3
+requests = 3
+max_slots = 2
+max_ballots = 2
+workers = 250
