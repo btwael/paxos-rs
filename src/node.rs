@@ -9,9 +9,12 @@ use crate::{
 use bytes::Bytes;
 use traceforge_rounds::set::{SetComm, SetCommError, SetTransport};
 
+type PaxosComm<T> = SetComm<PaxosKey, PaxosRound, T>;
+type PaxosCommError<E> = SetCommError<PaxosKey, PaxosRound, Command, E>;
+
 /// State manager for multi-paxos group
 pub struct Node<T: SetTransport<PaxosKey, PaxosRound, Command>> {
-    comm: SetComm<PaxosKey, PaxosRound, T>,
+    comm: PaxosComm<T>,
     config: Configuration<T::Node>,
     proposer: Proposer,
     window: SlotWindow,
@@ -24,10 +27,7 @@ where
     T::Error: std::fmt::Debug,
 {
     /// Node creation from a sender and starting configuration
-    pub fn with_comm(
-        comm: SetComm<PaxosKey, PaxosRound, T>,
-        config: Configuration<T::Node>,
-    ) -> Node<T> {
+    pub fn with_comm(comm: PaxosComm<T>, config: Configuration<T::Node>) -> Node<T> {
         let (p1_quorum, p2_quorum) = config.quorum_size();
         let node = config.current();
         Node {
@@ -43,11 +43,7 @@ where
         Self::with_comm(SetComm::new(transport), config)
     }
 
-    pub fn comm(&self) -> &SetComm<PaxosKey, PaxosRound, T> {
-        &self.comm
-    }
-
-    pub fn comm_mut(&mut self) -> &mut SetComm<PaxosKey, PaxosRound, T> {
+    pub fn comm_mut(&mut self) -> &mut PaxosComm<T> {
         &mut self.comm
     }
 
@@ -206,42 +202,37 @@ where
     }
 
     pub fn receive_stamped(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) {
-        assert_eq!(
-            key,
-            cmd.key_for(self.config.current()),
-            "transport key must match the command's Paxos key for this receiver"
+        assert!(
+            self.accept_stamped(key, &round, &cmd),
+            "received stamped command must match the command's Paxos key and round"
         );
-        if let Some((protocol_key, protocol_round)) = cmd.protocol_stamp() {
-            assert_eq!(key, protocol_key, "transport key must match the command's Paxos key");
-            assert_eq!(
-                round, protocol_round,
-                "transport stamp must match the command's Paxos round"
-            );
-            self.comm
-                .on(key)
-                .rounds()
-                .jump(round)
-                .expect("received stamped command must not move to the past");
-        }
         self.receive(cmd);
     }
 
     fn receive_stamped_checked(&mut self, key: PaxosKey, round: PaxosRound, cmd: Command) -> bool {
+        if !self.accept_stamped(key, &round, &cmd) {
+            return false;
+        }
+
+        self.receive(cmd);
+        true
+    }
+
+    fn accept_stamped(&mut self, key: PaxosKey, round: &PaxosRound, cmd: &Command) -> bool {
         if key != cmd.key_for(self.config.current()) {
             return false;
         }
 
         if let Some((protocol_key, protocol_round)) = cmd.protocol_stamp() {
-            if key != protocol_key || round != protocol_round {
+            if key != protocol_key || round != &protocol_round {
                 return false;
             }
 
-            if self.comm.on(key).rounds().jump(round).is_err() {
+            if self.comm.on(key).rounds().jump(round.clone()).is_err() {
                 return false;
             }
         }
 
-        self.receive(cmd);
         true
     }
 
@@ -251,30 +242,13 @@ where
         ballot: Ballot,
         min: usize,
         max: usize,
-    ) -> Result<usize, SetCommError<PaxosKey, PaxosRound, Command, T::Error>>
+    ) -> Result<usize, PaxosCommError<T::Error>>
     where
         Command: 'static,
     {
-        let key = PaxosKey::Slot { slot, proposer: ballot.1 };
-        self.enter_round(key, ballot, Phase::Promise);
-        let messages = self.comm.on(key).inbox_with_bounds_with::<Command, _>(
-            min,
-            Some(max),
-            move |local, remote| {
-                local.ballot() == remote.ballot()
-                    && local.phase() == Phase::Promise
-                    && remote.phase() == Phase::Promise
-            },
-        )?;
-
-        let mut count = 0;
-        for msg in messages.into_iter().flatten() {
-            if let Command::Promise { .. } = msg {
-                count += 1;
-                self.receive(msg);
-            }
-        }
-        Ok(count)
+        self.collect_phase_inbox(slot, ballot, Phase::Promise, min, max, |cmd| {
+            matches!(cmd, Command::Promise { .. })
+        })
     }
 
     pub fn collect_accepted_inbox(
@@ -283,25 +257,35 @@ where
         ballot: Ballot,
         min: usize,
         max: usize,
-    ) -> Result<usize, SetCommError<PaxosKey, PaxosRound, Command, T::Error>>
+    ) -> Result<usize, PaxosCommError<T::Error>>
     where
         Command: 'static,
     {
+        self.collect_phase_inbox(slot, ballot, Phase::Accepted, min, max, |cmd| {
+            matches!(cmd, Command::Accepted { .. })
+        })
+    }
+
+    fn collect_phase_inbox<F>(&mut self, slot: Slot, ballot: Ballot, phase: Phase, min: usize, max: usize, mut accepts: F) -> Result<usize, PaxosCommError<T::Error>>
+    where
+        Command: 'static,
+        F: FnMut(&Command) -> bool,
+    {
         let key = PaxosKey::Slot { slot, proposer: ballot.1 };
-        self.enter_round(key, ballot, Phase::Accepted);
+        self.enter_round(key, ballot, phase);
         let messages = self.comm.on(key).inbox_with_bounds_with::<Command, _>(
             min,
             Some(max),
             move |local, remote| {
                 local.ballot() == remote.ballot()
-                    && local.phase() == Phase::Accepted
-                    && remote.phase() == Phase::Accepted
+                    && local.phase() == phase
+                    && remote.phase() == phase
             },
         )?;
 
         let mut count = 0;
         for msg in messages.into_iter().flatten() {
-            if let Command::Accepted { .. } = msg {
+            if accepts(&msg) {
                 count += 1;
                 self.receive(msg);
             }

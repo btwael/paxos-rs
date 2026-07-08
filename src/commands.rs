@@ -142,12 +142,8 @@ impl Command {
             | Command::Promise { slot, ballot, .. }
             | Command::Accept { slot, ballot, .. }
             | Command::Accepted { slot, ballot, .. }
-            | Command::Resolution { slot, ballot, .. } => {
-                PaxosKey::Slot { slot: *slot, proposer: ballot.1 }
-            }
-            Command::Reject { slot, proposed, .. } => {
-                PaxosKey::Slot { slot: *slot, proposer: proposed.1 }
-            }
+            | Command::Resolution { slot, ballot, .. } => Self::slot_key(*slot, *ballot),
+            Command::Reject { slot, proposed, .. } => Self::slot_key(*slot, *proposed),
             Command::Catchup { slot, .. } => PaxosKey::Catchup { slot: *slot, leader: receiver },
         }
     }
@@ -160,30 +156,32 @@ impl Command {
     pub fn protocol_stamp(&self) -> Option<(PaxosKey, PaxosRound)> {
         match self {
             Command::Proposal(_) | Command::Catchup { .. } => None,
-            Command::Prepare { slot, ballot } => Some((
-                PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
-                PaxosRound::new(ballot.0, Phase::Prepare),
-            )),
-            Command::Promise { slot, ballot, .. } => Some((
-                PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
-                PaxosRound::new(ballot.0, Phase::Promise),
-            )),
-            Command::Accept { slot, ballot, .. } => Some((
-                PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
-                PaxosRound::new(ballot.0, Phase::Accept),
-            )),
-            Command::Reject { slot, proposed, .. } => Some((
-                PaxosKey::Slot { slot: *slot, proposer: proposed.1 },
-                PaxosRound::new(proposed.0, Phase::Reject),
-            )),
-            Command::Accepted { slot, ballot, .. } => Some((
-                PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
-                PaxosRound::new(ballot.0, Phase::Accepted),
-            )),
-            Command::Resolution { slot, ballot, .. } => Some((
-                PaxosKey::Slot { slot: *slot, proposer: ballot.1 },
-                PaxosRound::new(ballot.0, Phase::Resolution),
-            )),
+            Command::Prepare { slot, ballot } => {
+                Some(Self::slot_stamp(*slot, *ballot, Phase::Prepare))
+            }
+            Command::Promise { slot, ballot, .. } => {
+                Some(Self::slot_stamp(*slot, *ballot, Phase::Promise))
+            }
+            Command::Accept { slot, ballot, .. } => {
+                Some(Self::slot_stamp(*slot, *ballot, Phase::Accept))
+            }
+            Command::Reject { slot, proposed, .. } => {
+                Some(Self::slot_stamp(*slot, *proposed, Phase::Reject))
+            }
+            Command::Accepted { slot, ballot, .. } => {
+                Some(Self::slot_stamp(*slot, *ballot, Phase::Accepted))
+            }
+            Command::Resolution { slot, ballot, .. } => {
+                Some(Self::slot_stamp(*slot, *ballot, Phase::Resolution))
+            }
         }
+    }
+
+    fn slot_key(slot: Slot, ballot: Ballot) -> PaxosKey {
+        PaxosKey::Slot { slot, proposer: ballot.1 }
+    }
+
+    fn slot_stamp(slot: Slot, ballot: Ballot, phase: Phase) -> (PaxosKey, PaxosRound) {
+        (Self::slot_key(slot, ballot), PaxosRound::new(ballot.0, phase))
     }
 }
